@@ -1,0 +1,9 @@
+# Rust build output
+target/
+
+# VS Code
+.vscode/
+
+# Env files (secrets)
+.env
+.env.*
