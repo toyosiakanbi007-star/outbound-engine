@@ -10,7 +10,7 @@ axum  = { version = "0.7", features = ["macros", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "macros"] }
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
@@ -19,5 +19,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 dotenvy = "0.15"
 
-# pin home to a stable version that doesn’t use edition2024
 home = "=0.5.11"
+
+chrono = { version = "0.4", features = ["serde", "clock"] }

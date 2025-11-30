@@ -1,20 +1,24 @@
 mod config;
+mod db;
+mod jobs;
+mod routes;
 
 use axum::{
     extract::State,
-    routing::get,
+    http::StatusCode,
+    routing::{get, post},
     Json, Router,
 };
-use config::{AppEnv, Config};
+use config::Config;
+use db::DbPool;
 use serde_json::json;
-    use sqlx::PgPool;
 use std::net::SocketAddr;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
 struct AppState {
-    db: PgPool,
+    db: DbPool,
     config: Config,
 }
 
@@ -28,12 +32,19 @@ async fn main() -> config::Result<()> {
         )
         .init();
 
+    // Allow a CLI mode: `cargo run -- --db-check`
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--db-check") {
+        run_db_check().await?;
+        return Ok(());
+    }
+
     // 2. Load configuration
     let cfg = config::load()?;
     info!("Starting backend in {:?} mode", cfg.env);
 
     // 3. Create Postgres connection pool
-    let pool = PgPool::connect(&cfg.database_url).await?;
+    let pool = db::create_pool(&cfg.database_url).await?;
     info!("Connected to Postgres");
 
     // 4. Build application state
@@ -42,9 +53,10 @@ async fn main() -> config::Result<()> {
         config: cfg.clone(),
     };
 
-    // 5. Build router with /health route
+    // 5. Build router with /health and /db-health routes
     let app = Router::new()
-        .route("/health", get(health_check))
+        .route("/health", get(db_health))
+        .route("/db-health", get(db_health))
         .with_state(state);
 
     // 6. Start HTTP server
@@ -56,7 +68,8 @@ async fn main() -> config::Result<()> {
     Ok(())
 }
 
-async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> {
+/// Shared DB health handler
+async fn db_health(State(state): State<AppState>) -> Json<serde_json::Value> {
     // Simple DB check: SELECT 1
     if let Err(err) = sqlx::query("SELECT 1").execute(&state.db).await {
         error!("DB health check failed: {:?}", err);
@@ -70,4 +83,20 @@ async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> 
         "status": "ok",
         "env": format!("{:?}", state.config.env),
     }))
+}
+
+/// CLI-style DB check: `cargo run -- --db-check`
+async fn run_db_check() -> config::Result<()> {
+    let cfg = config::load()?;
+    let pool = db::create_pool(&cfg.database_url).await?;
+
+    info!("Running DB check against {}", cfg.database_url);
+
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM clients")
+        .fetch_one(&pool)
+        .await?;
+
+    println!("clients table row count = {}", count);
+
+    Ok(())
 }
