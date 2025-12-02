@@ -16,8 +16,8 @@ pub async fn run_worker(pool: DbPool) {
     loop {
         match fetch_next_job(&pool, &worker_id).await {
             Ok(Some(job)) => {
-                if let Err(err) = process_job(&pool, job, &worker_id).await {
-                    error!("Error while processing job: {:?}", err);
+                if let Err(err) = process_job(&pool, &job, &worker_id).await {
+                    error!("Error while processing job {}: {:?}", job.id, err);
 
                     if let Err(e) =
                         mark_job_failed(&pool, job.id, &worker_id, &format!("{:?}", err)).await
@@ -39,16 +39,26 @@ pub async fn run_worker(pool: DbPool) {
 }
 
 /// Fetch the next pending job and mark it as running for this worker.
-/// Uses SELECT ... FOR UPDATE SKIP LOCKED inside a transaction.
+/// Uses a single UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING ... query.
 pub async fn fetch_next_job(
     pool: &DbPool,
     worker_id: &str,
 ) -> Result<Option<Job>, Error> {
-    let mut tx = pool.begin().await?;
-
-    let job_opt = sqlx::query_as::<_, Job>(
+    let job = sqlx::query_as::<_, Job>(
         r#"
-        SELECT
+        UPDATE jobs
+        SET status = $2,
+            assigned_worker = $1,
+            attempts = attempts + 1,
+            updated_at = NOW()
+        WHERE id = (
+            SELECT id FROM jobs
+            WHERE status = $3
+            ORDER BY created_at
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        )
+        RETURNING
             id,
             client_id,
             campaign_id,
@@ -63,56 +73,24 @@ pub async fn fetch_next_job(
             created_at,
             updated_at,
             completed_at
-        FROM jobs
-        WHERE status = 'pending'
-        ORDER BY created_at
-        FOR UPDATE SKIP LOCKED
-        LIMIT 1
         "#,
     )
-    .fetch_optional(&mut tx)
+    // $1 = assigned_worker
+    .bind(worker_id)
+    // $2 = new status
+    .bind(JobStatus::Running.as_str())
+    // $3 = old status filter
+    .bind(JobStatus::Pending.as_str())
+    .fetch_optional(pool)
     .await?;
-
-    let job = match job_opt {
-        Some(mut job) => {
-            // Mark the job as running and assign to this worker.
-            sqlx::query(
-                r#"
-                UPDATE jobs
-                SET status = $2,
-                    assigned_worker = $3,
-                    attempts = attempts + 1,
-                    updated_at = NOW()
-                WHERE id = $1
-                "#,
-            )
-            .bind(job.id)
-            .bind(JobStatus::Running.as_str())
-            .bind(worker_id)
-            .execute(&mut tx)
-            .await?;
-
-            // Keep the Rust struct in sync.
-            job.status = JobStatus::Running.as_str().to_string();
-            job.assigned_worker = Some(worker_id.to_string());
-            job.attempts += 1;
-
-            tx.commit().await?;
-            Ok(Some(job))
-        }
-        None => {
-            tx.commit().await?;
-            Ok(None)
-        }
-    }?;
 
     Ok(job)
 }
 
-/// Process a single job: decode its type, log, and mark it done (for now).
+/// Process a single job: decode type, log, and mark it done (for now).
 pub async fn process_job(
     pool: &DbPool,
-    job: Job,
+    job: &Job,
     worker_id: &str,
 ) -> Result<(), Error> {
     let job_type = match parse_job_type(&job.job_type) {
@@ -129,16 +107,28 @@ pub async fn process_job(
 
     match job_type {
         JobType::DiscoverProspects => {
-            info!("Worker {} handling job {} of type DISCOVER_PROSPECTS", worker_id, job.id);
+            info!(
+                "Worker {} handling job {} of type DISCOVER_PROSPECTS",
+                worker_id, job.id
+            );
         }
         JobType::EnrichLeads => {
-            info!("Worker {} handling job {} of type ENRICH_LEADS", worker_id, job.id);
+            info!(
+                "Worker {} handling job {} of type ENRICH_LEADS",
+                worker_id, job.id
+            );
         }
         JobType::AiPersonalize => {
-            info!("Worker {} handling job {} of type AI_PERSONALIZE", worker_id, job.id);
+            info!(
+                "Worker {} handling job {} of type AI_PERSONALIZE",
+                worker_id, job.id
+            );
         }
         JobType::SendEmails => {
-            info!("Worker {} handling job {} of type SEND_EMAILS", worker_id, job.id);
+            info!(
+                "Worker {} handling job {} of type SEND_EMAILS",
+                worker_id, job.id
+            );
         }
         JobType::ClientAcquisitionOutreach => {
             info!(
@@ -148,7 +138,7 @@ pub async fn process_job(
         }
     }
 
-    // TODO: real business logic goes here.
+    // TODO: actual business logic for each type.
     // For now we just mark the job as done immediately.
     mark_job_done(pool, job.id).await?;
 
