@@ -2,6 +2,7 @@ mod config;
 mod db;
 mod jobs;
 mod routes;
+mod worker;
 
 use axum::{
     extract::State,
@@ -17,14 +18,14 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
-struct AppState {
-    db: DbPool,
-    config: Config,
+pub struct AppState {
+    pub db: DbPool,
+    pub config: Config,
 }
 
 #[tokio::main]
 async fn main() -> config::Result<()> {
-    // 1. Initialize logging
+    // 1. Initialize structured logging
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -32,60 +33,96 @@ async fn main() -> config::Result<()> {
         )
         .init();
 
-    // Allow a CLI mode: `cargo run -- --db-check`
+    // 2. Optional CLI mode for quick DB checks: `cargo run -- --db-check`
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--db-check") {
         run_db_check().await?;
         return Ok(());
     }
 
-    // 2. Load configuration
-    let cfg = config::load()?;
-    info!("Starting backend in {:?} mode", cfg.env);
+    // 3. MODE env var decides server vs worker
+    let mode = std::env::var("MODE").unwrap_or_else(|_| "server".to_string());
 
-    // 3. Create Postgres connection pool
+    // 4. Load config & create DB pool
+    let cfg = config::load()?;
+    info!("Starting backend in {:?} mode (MODE={})", cfg.env, mode);
+
     let pool = db::create_pool(&cfg.database_url).await?;
     info!("Connected to Postgres");
 
-    // 4. Build application state
-    let state = AppState {
-        db: pool,
-        config: cfg.clone(),
-    };
+    // 5. Branch: server mode or worker mode
+    match mode.as_str() {
+        "worker" => {
+            // Worker: infinite loop processing jobs
+            worker::run_worker(pool).await;
+        }
+        _ => {
+            // Default: HTTP server
+            let state = AppState {
+                db: pool,
+                config: cfg.clone(),
+            };
+            run_server(state, cfg.http_port).await?;
+        }
+    }
 
-    // 5. Build router with /health and /db-health routes
+    Ok(())
+}
+
+// ========== Server mode ==========
+
+async fn run_server(state: AppState, http_port: u16) -> config::Result<()> {
     let app = Router::new()
-        .route("/health", get(db_health))
-        .route("/db-health", get(db_health))
-        .with_state(state);
+        .route("/health", get(health_handler))
+        .route("/version", get(version_handler))
+        .route("/db-health", get(db_health_handler))
+        .route(
+            "/debug/jobs/test-send",
+            post(routes::debug::create_test_send_job_handler),
+        )
+        .with_state(state.clone());
 
-    // 6. Start HTTP server
-    let addr = SocketAddr::from(([0, 0, 0, 0], cfg.http_port));
-    info!("Listening on http://{}", addr);
+    let addr = SocketAddr::from(([0, 0, 0, 0], http_port));
+    info!("HTTP server listening on http://{}", addr);
 
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
 
     Ok(())
 }
 
-/// Shared DB health handler
-async fn db_health(State(state): State<AppState>) -> Json<serde_json::Value> {
-    // Simple DB check: SELECT 1
-    if let Err(err) = sqlx::query("SELECT 1").execute(&state.db).await {
-        error!("DB health check failed: {:?}", err);
-        return Json(json!({
-            "status": "error",
-            "db": "down",
-        }));
-    }
-
+// Health: simple JSON with env
+async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({
         "status": "ok",
         "env": format!("{:?}", state.config.env),
     }))
 }
 
-/// CLI-style DB check: `cargo run -- --db-check`
+// Version: hard-coded for now
+async fn version_handler() -> Json<serde_json::Value> {
+    Json(json!({ "version": "0.1.0" }))
+}
+
+// DB health: run `SELECT 1`
+async fn db_health_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match sqlx::query("SELECT 1").execute(&state.db).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({ "status": "ok", "env": format!("{:?}", state.config.env) })),
+        ),
+        Err(err) => {
+            error!("DB health check failed: {:?}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "status": "error", "db": "down" })),
+            )
+        }
+    }
+}
+
+// CLI-db-check: `cargo run -- --db-check`
 async fn run_db_check() -> config::Result<()> {
     let cfg = config::load()?;
     let pool = db::create_pool(&cfg.database_url).await?;
