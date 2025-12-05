@@ -1,8 +1,9 @@
 mod config;
 mod db;
 mod jobs;
-mod routes;
 mod worker;
+mod news; // <--- add this
+
 
 use axum::{
     extract::State,
