@@ -30,3 +30,14 @@ dotenvy = "0.15"
 home = "=0.5.11"
 
 chrono = { version = "0.4", features = ["serde", "clock"] }
+
+anyhow = "1.0"
+async-trait = "0.1"
+
+reqwest = { version = "0.12", features = [
+    "json",
+    "gzip",
+    "brotli",
+    "deflate",
+    "rustls-tls"
+] }

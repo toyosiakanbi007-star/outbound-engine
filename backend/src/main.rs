@@ -2,7 +2,9 @@ mod config;
 mod db;
 mod jobs;
 mod worker;
-mod news; // <--- add this
+mod news;
+mod routes; // <-- add this line
+
 
 
 use axum::{
