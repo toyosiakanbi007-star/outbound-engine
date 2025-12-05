@@ -6,6 +6,8 @@ use sqlx::Error;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use crate::news::client::DynNewsSourcingClient;
+
 
 /// Worker entry point.
 /// Called when MODE=worker; runs an infinite loop.

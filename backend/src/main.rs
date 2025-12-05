@@ -1,11 +1,9 @@
 mod config;
 mod db;
 mod jobs;
-mod worker;
 mod news;
-mod routes; // <-- add this line
-
-
+mod routes;
+mod worker; // <-- add this line
 
 use axum::{
     extract::State,
@@ -15,11 +13,11 @@ use axum::{
 };
 use config::Config;
 use db::DbPool;
+use news::client::HttpNewsSourcingClient;
 use serde_json::json;
 use std::net::SocketAddr;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use news::client::HttpNewsSourcingClient;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -32,8 +30,7 @@ async fn main() -> config::Result<()> {
     // 1. Initialize structured logging
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -55,25 +52,23 @@ async fn main() -> config::Result<()> {
     info!("Connected to Postgres");
 
     // 5. Branch: server mode or worker mode
-   // 5. Branch: server mode or worker mode
-match mode.as_str() {
-    "worker" => {
-        // Build news sourcing client from env for worker mode
-        let news_client = HttpNewsSourcingClient::from_env()?.into_dyn();
+    match mode.as_str() {
+        "worker" => {
+            // Build news sourcing client from env for worker mode
+            let news_client = HttpNewsSourcingClient::from_env()?.into_dyn();
 
-        // Worker: infinite loop processing jobs
-        worker::run_worker(pool, news_client).await?;
+            // Worker: infinite loop processing jobs
+            worker::run_worker(pool, news_client).await?;
+        }
+        _ => {
+            // Default: HTTP server
+            let state = AppState {
+                db: pool,
+                config: cfg.clone(),
+            };
+            run_server(state, cfg.http_port).await?;
+        }
     }
-    _ => {
-        // Default: HTTP server
-        let state = AppState {
-            db: pool,
-            config: cfg.clone(),
-        };
-        run_server(state, cfg.http_port).await?;
-    }
-}
-
 
     Ok(())
 }
@@ -113,9 +108,7 @@ async fn version_handler() -> Json<serde_json::Value> {
 }
 
 // DB health: run `SELECT 1`
-async fn db_health_handler(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn db_health_handler(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     match sqlx::query("SELECT 1").execute(&state.db).await {
         Ok(_) => (
             StatusCode::OK,
