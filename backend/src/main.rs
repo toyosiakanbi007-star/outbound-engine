@@ -19,6 +19,7 @@ use serde_json::json;
 use std::net::SocketAddr;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+use news::client::HttpNewsSourcingClient;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -54,20 +55,25 @@ async fn main() -> config::Result<()> {
     info!("Connected to Postgres");
 
     // 5. Branch: server mode or worker mode
-    match mode.as_str() {
-        "worker" => {
-            // Worker: infinite loop processing jobs
-            worker::run_worker(pool).await;
-        }
-        _ => {
-            // Default: HTTP server
-            let state = AppState {
-                db: pool,
-                config: cfg.clone(),
-            };
-            run_server(state, cfg.http_port).await?;
-        }
+   // 5. Branch: server mode or worker mode
+match mode.as_str() {
+    "worker" => {
+        // Build news sourcing client from env for worker mode
+        let news_client = HttpNewsSourcingClient::from_env()?.into_dyn();
+
+        // Worker: infinite loop processing jobs
+        worker::run_worker(pool, news_client).await?;
     }
+    _ => {
+        // Default: HTTP server
+        let state = AppState {
+            db: pool,
+            config: cfg.clone(),
+        };
+        run_server(state, cfg.http_port).await?;
+    }
+}
+
 
     Ok(())
 }
