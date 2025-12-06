@@ -2,11 +2,11 @@
 
 use crate::db::DbPool;
 use crate::jobs::models::{Job, JobStatus, JobType};
+use crate::news::client::DynNewsSourcingClient;
 use sqlx::Error;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use crate::news::client::DynNewsSourcingClient;
 /// Worker entry point.
 /// Called when MODE=worker; runs an infinite loop.
 pub async fn run_worker(pool: DbPool, news_client: DynNewsSourcingClient) -> anyhow::Result<()> {
@@ -49,10 +49,7 @@ pub async fn run_worker(pool: DbPool, news_client: DynNewsSourcingClient) -> any
 
 /// Fetch the next pending job and mark it as running for this worker.
 /// Uses a single UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING ... query.
-pub async fn fetch_next_job(
-    pool: &DbPool,
-    worker_id: &str,
-) -> Result<Option<Job>, Error> {
+pub async fn fetch_next_job(pool: &DbPool, worker_id: &str) -> Result<Option<Job>, Error> {
     let job = sqlx::query_as::<_, Job>(
         r#"
         UPDATE jobs
@@ -97,11 +94,7 @@ pub async fn fetch_next_job(
 }
 
 /// Process a single job: decode type, log, and mark it done (for now).
-pub async fn process_job(
-    pool: &DbPool,
-    job: &Job,
-    worker_id: &str,
-) -> Result<(), Error> {
+pub async fn process_job(pool: &DbPool, job: &Job, worker_id: &str) -> Result<(), Error> {
     // Use the new helper on Job to parse job_type -> JobType enum
     let job_type = match job.job_type_enum() {
         Ok(t) => t,
@@ -168,7 +161,6 @@ pub async fn process_job(
 
     Ok(())
 }
-
 
 /// Map job_type string from the DB into the JobType enum.
 fn parse_job_type(s: &str) -> Option<JobType> {
