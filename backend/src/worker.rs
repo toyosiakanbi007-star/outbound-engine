@@ -102,13 +102,15 @@ pub async fn process_job(
     job: &Job,
     worker_id: &str,
 ) -> Result<(), Error> {
-    let job_type = match parse_job_type(&job.job_type) {
-        Some(t) => t,
-        None => {
+    // Use the new helper on Job to parse job_type -> JobType enum
+    let job_type = match job.job_type_enum() {
+        Ok(t) => t,
+        Err(err) => {
             warn!(
-                "Unknown job_type '{}' for job {}, marking as failed",
-                job.job_type, job.id
+                "Unknown job_type '{}' for job {} ({}) , marking as failed",
+                job.job_type, job.id, err
             );
+            // Keep the same behavior: mark as failed and return Ok(())
             mark_job_failed(pool, job.id, worker_id, "unknown job_type").await?;
             return Ok(());
         }
@@ -120,30 +122,43 @@ pub async fn process_job(
                 "Worker {} handling job {} of type DISCOVER_PROSPECTS",
                 worker_id, job.id
             );
+            // TODO: actual business logic for DiscoverProspects
         }
         JobType::EnrichLeads => {
             info!(
                 "Worker {} handling job {} of type ENRICH_LEADS",
                 worker_id, job.id
             );
+            // TODO: actual business logic for EnrichLeads
         }
         JobType::AiPersonalize => {
             info!(
                 "Worker {} handling job {} of type AI_PERSONALIZE",
                 worker_id, job.id
             );
+            // TODO: actual business logic for AiPersonalize
         }
         JobType::SendEmails => {
             info!(
                 "Worker {} handling job {} of type SEND_EMAILS",
                 worker_id, job.id
             );
+            // TODO: actual business logic for SendEmails
         }
         JobType::ClientAcquisitionOutreach => {
             info!(
                 "Worker {} handling job {} of type CLIENT_ACQUISITION_OUTREACH",
                 worker_id, job.id
             );
+            // TODO: actual business logic for ClientAcquisitionOutreach
+        }
+        JobType::FetchNews => {
+            info!(
+                "Worker {} handling job {} of type FETCH_NEWS (skeleton handler)",
+                worker_id, job.id
+            );
+            // Checklist 4: just log for now.
+            // In Checklist 5 we'll actually call the news client here.
         }
     }
 
@@ -153,6 +168,7 @@ pub async fn process_job(
 
     Ok(())
 }
+
 
 /// Map job_type string from the DB into the JobType enum.
 fn parse_job_type(s: &str) -> Option<JobType> {
