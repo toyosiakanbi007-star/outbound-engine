@@ -12,6 +12,7 @@ pub enum JobType {
     AiPersonalize,
     SendEmails,
     ClientAcquisitionOutreach,
+    FetchNews,
 }
 
 impl JobType {
