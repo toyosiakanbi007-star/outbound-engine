@@ -7,12 +7,19 @@ use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 use crate::news::client::DynNewsSourcingClient;
-
-
 /// Worker entry point.
 /// Called when MODE=worker; runs an infinite loop.
-pub async fn run_worker(pool: DbPool) {
+pub async fn run_worker(pool: DbPool, news_client: DynNewsSourcingClient) -> anyhow::Result<()> {
     let worker_id = std::env::var("WORKER_ID").unwrap_or_else(|_| "worker-1".to_string());
+
+    // Prevent "unused variable" warning for now; we'll use this in FETCH_NEWS later.
+    let _ = &news_client;
+
+    tracing::info!(
+        target: "backend::worker",
+        "Worker starting with id={} (MODE=worker)",
+        worker_id
+    );
     info!("Worker starting with id={} (MODE=worker)", worker_id);
 
     loop {
