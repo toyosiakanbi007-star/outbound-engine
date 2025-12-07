@@ -2,18 +2,19 @@
 
 use crate::db::DbPool;
 use crate::jobs::models::{Job, JobStatus, JobType};
-use crate::news::client::DynNewsSourcingClient;
-use sqlx::Error;
+use crate::news::client::{DynNewsSourcingClient, NewsFetchRequest};
+use crate::news::models::NewsItem;
+
+use serde::Deserialize;
+use sqlx::{self, Error};
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
 /// Worker entry point.
 /// Called when MODE=worker; runs an infinite loop.
 pub async fn run_worker(pool: DbPool, news_client: DynNewsSourcingClient) -> anyhow::Result<()> {
     let worker_id = std::env::var("WORKER_ID").unwrap_or_else(|_| "worker-1".to_string());
-
-    // Prevent "unused variable" warning for now; we'll use this in FETCH_NEWS later.
-    let _ = &news_client;
 
     tracing::info!(
         target: "backend::worker",
@@ -25,7 +26,7 @@ pub async fn run_worker(pool: DbPool, news_client: DynNewsSourcingClient) -> any
     loop {
         match fetch_next_job(&pool, &worker_id).await {
             Ok(Some(job)) => {
-                if let Err(err) = process_job(&pool, &job, &worker_id).await {
+                if let Err(err) = process_job(&pool, &job, &worker_id, &news_client).await {
                     error!("Error while processing job {}: {:?}", job.id, err);
 
                     if let Err(e) =
@@ -93,9 +94,14 @@ pub async fn fetch_next_job(pool: &DbPool, worker_id: &str) -> Result<Option<Job
     Ok(job)
 }
 
-/// Process a single job: decode type, log, and mark it done (for now).
-pub async fn process_job(pool: &DbPool, job: &Job, worker_id: &str) -> Result<(), Error> {
-    // Use the new helper on Job to parse job_type -> JobType enum
+/// Process a single job: decode type, dispatch, and mark it done if successful.
+pub async fn process_job(
+    pool: &DbPool,
+    job: &Job,
+    worker_id: &str,
+    news_client: &DynNewsSourcingClient,
+) -> Result<(), Error> {
+    // Parse DB job_type string -> JobType enum
     let job_type = match job.job_type_enum() {
         Ok(t) => t,
         Err(err) => {
@@ -147,31 +153,214 @@ pub async fn process_job(pool: &DbPool, job: &Job, worker_id: &str) -> Result<()
         }
         JobType::FetchNews => {
             info!(
-                "Worker {} handling job {} of type FETCH_NEWS (skeleton handler)",
+                "Worker {} handling job {} of type FETCH_NEWS",
                 worker_id, job.id
             );
-            // Checklist 4: just log for now.
-            // In Checklist 5 we'll actually call the news client here.
+
+            // Call the real handler that talks to the news service and writes to DB.
+            if let Err(e) = handle_fetch_news_job(pool, job, worker_id, news_client).await {
+                warn!(
+                    "Worker {}: error while handling FETCH_NEWS job {}: {:?}",
+                    worker_id, job.id, e
+                );
+                // Bubble up DB errors so caller can mark job failed
+                return Err(e);
+            }
         }
     }
 
-    // TODO: actual business logic for each type.
-    // For now we just mark the job as done immediately.
+    // For now we just mark the job as done after handler runs successfully.
     mark_job_done(pool, job.id).await?;
 
     Ok(())
 }
 
-/// Map job_type string from the DB into the JobType enum.
-fn parse_job_type(s: &str) -> Option<JobType> {
-    match s {
-        "discover_prospects" => Some(JobType::DiscoverProspects),
-        "enrich_leads" => Some(JobType::EnrichLeads),
-        "ai_personalize" => Some(JobType::AiPersonalize),
-        "send_emails" => Some(JobType::SendEmails),
-        "client_acquisition_outreach" => Some(JobType::ClientAcquisitionOutreach),
-        _ => None,
+/// Payload shape for FETCH_NEWS jobs:
+///
+/// {
+///   "client_id": "uuid",
+///   "company_id": "uuid",
+///   "max_results": 10   // optional
+/// }
+#[derive(Debug, Clone, Deserialize)]
+struct FetchNewsPayload {
+    pub client_id: Uuid,
+    pub company_id: Uuid,
+    pub max_results: Option<u32>,
+}
+
+/// Minimal subset of company fields we need for the news request.
+#[derive(Debug, sqlx::FromRow)]
+struct CompanyInfo {
+    pub id: Uuid,
+    pub client_id: Uuid,
+    pub name: String,
+    pub domain: String,
+    pub industry: Option<String>,
+    pub country: Option<String>,
+}
+
+/// Handle a FETCH_NEWS job:
+/// - parse payload,
+/// - load company,
+/// - call news service,
+/// - insert rows into company_news (with dedupe via UNIQUE index).
+async fn handle_fetch_news_job(
+    pool: &DbPool,
+    job: &Job,
+    worker_id: &str,
+    news_client: &DynNewsSourcingClient,
+) -> Result<(), Error> {
+    // 1) Parse payload JSON into FetchNewsPayload
+    let payload: FetchNewsPayload = match serde_json::from_value(job.payload.clone()) {
+        Ok(p) => p,
+        Err(err) => {
+            warn!(
+                "Worker {}: invalid FETCH_NEWS payload for job {}: {}",
+                worker_id, job.id, err
+            );
+            // Treat as handled but bad payload; do not crash the worker.
+            return Ok(());
+        }
+    };
+
+    // 2) Load company from DB
+    let company: Option<CompanyInfo> = sqlx::query_as::<_, CompanyInfo>(
+        r#"
+        SELECT
+            id,
+            client_id,
+            name,
+            domain,
+            industry,
+            country
+        FROM companies
+        WHERE id = $1 AND client_id = $2
+        "#,
+    )
+    .bind(payload.company_id)
+    .bind(payload.client_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let company = match company {
+        Some(c) => c,
+        None => {
+            warn!(
+                "Worker {}: FETCH_NEWS job {} refers to missing company_id={} / client_id={}",
+                worker_id, job.id, payload.company_id, payload.client_id
+            );
+            return Ok(());
+        }
+    };
+
+    // 3) Build request for the news sourcing service
+    let req = NewsFetchRequest {
+        client_id: company.client_id,
+        company_id: company.id,
+        company_name: company.name.clone(),
+        domain: company.domain.clone(),
+        industry: company.industry.clone(),
+        country: company.country.clone(),
+        max_results: payload.max_results,
+    };
+
+    // 4) Call the news service
+    let items_res = news_client.fetch_news_for_company(&req).await;
+
+    let items: Vec<NewsItem> = match items_res {
+        Ok(list) => list,
+        Err(err) => {
+            // Not a DB error, so log and treat job as "handled but failed external call".
+            warn!(
+                "Worker {}: news service error for job {} / company {}: {}",
+                worker_id, job.id, company.id, err
+            );
+            return Ok(());
+        }
+    };
+
+    if items.is_empty() {
+        info!(
+            "Worker {}: FETCH_NEWS job {}: no news items returned for company {}",
+            worker_id, job.id, company.id
+        );
+        return Ok(());
     }
+
+    info!(
+        "Worker {}: FETCH_NEWS job {}: inserting {} news items for company {}",
+        worker_id,
+        job.id,
+        items.len(),
+        company.id
+    );
+
+    // 5) Insert each NewsItem into company_news.
+    //
+    // Dedupe via unique index; if we hit 23505, log and continue.
+    for item in items {
+        let insert_res = sqlx::query(
+            r#"
+            INSERT INTO company_news (
+                client_id,
+                company_id,
+                title,
+                published_at,
+                location,
+                summary,
+                url,
+                source_type,
+                source_name,
+                tags,
+                confidence
+            )
+            VALUES (
+                $1, $2, $3, $4, $5,
+                $6, $7, $8, $9, $10, $11
+            )
+            "#,
+        )
+        .bind(company.client_id)
+        .bind(company.id)
+        .bind(&item.title)
+        .bind(item.date)          // Option<DateTime<Utc>>
+        .bind(item.location)      // Option<String>
+        .bind(item.summary)       // Option<String>
+        .bind(&item.url)
+        .bind(&item.source_type)
+        .bind(item.source_name)   // Option<String>
+        .bind(item.tags)          // Vec<String> -> text[]
+        .bind(item.confidence)    // f32
+        .execute(pool)
+        .await;
+
+        match insert_res {
+            Ok(_) => {
+                info!(
+                    "Worker {}: inserted news item '{}' for company {}",
+                    worker_id, item.title, company.id
+                );
+            }
+            Err(e) => {
+                if let sqlx::Error::Database(db_err) = &e {
+                    if db_err.code().as_deref() == Some("23505") {
+                        // Unique violation => duplicate news; skip.
+                        warn!(
+                            "Worker {}: duplicate news item '{}' for company {}, skipping",
+                            worker_id, item.title, company.id
+                        );
+                        continue;
+                    }
+                }
+
+                // Any other DB error is serious: bubble up.
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn mark_job_done(pool: &DbPool, job_id: Uuid) -> Result<(), Error> {
