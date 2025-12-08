@@ -5,6 +5,7 @@ mod news;
 mod routes;
 mod worker; // <-- add this line
 
+use crate::news::client::HttpNewsSourcingClient;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -13,14 +14,11 @@ use axum::{
 };
 use config::Config;
 use db::DbPool;
-use news::client::HttpNewsSourcingClient;
 use serde_json::json;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use crate::news::client::HttpNewsSourcingClient;
-use std::sync::Arc;
-
 
 #[derive(Clone)]
 pub struct AppState {
@@ -56,31 +54,30 @@ async fn main() -> config::Result<()> {
 
     // 5. Branch: server mode or worker mode
     match mode.as_str() {
-    "worker" => {
-        // Build news client from config
-        let news_client = HttpNewsSourcingClient::from_config(
-            cfg.news_service_base_url.clone(),
-            cfg.news_service_api_key.clone(),
-        )
-        .unwrap_or_else(|| {
-            // Fallback: use a dummy client pointing to example.com
-            Arc::new(HttpNewsSourcingClient::new(
-                "https://example.com".to_string(),
-                None,
-            )) as crate::news::client::DynNewsSourcingClient
-        });
+        "worker" => {
+            // Build news client from config
+            let news_client = HttpNewsSourcingClient::from_config(
+                cfg.news_service_base_url.clone(),
+                cfg.news_service_api_key.clone(),
+            )
+            .unwrap_or_else(|| {
+                // Fallback: use a dummy client pointing to example.com
+                Arc::new(HttpNewsSourcingClient::new(
+                    "https://example.com".to_string(),
+                    None,
+                )) as crate::news::client::DynNewsSourcingClient
+            });
 
-        worker::run_worker(pool, news_client).await?;
+            worker::run_worker(pool, news_client).await?;
+        }
+        _ => {
+            let state = AppState {
+                db: pool,
+                config: cfg.clone(),
+            };
+            run_server(state, cfg.http_port).await?;
+        }
     }
-    _ => {
-        let state = AppState {
-            db: pool,
-            config: cfg.clone(),
-        };
-        run_server(state, cfg.http_port).await?;
-    }
-}
-
 
     Ok(())
 }
