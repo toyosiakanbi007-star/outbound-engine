@@ -34,12 +34,52 @@ pub struct Config {
 
     pub apollo_api_key: Option<String>,
     pub prospeo_api_key: Option<String>,
+
+    // NEW: news service config
+    pub news_service_base_url: Option<String>,
+    pub news_service_api_key: Option<String>,
 }
 
 /// Entry point to load configuration
-pub fn load() -> Result<Config> {
-    load_dotenv()?;
-    Config::from_env()
+pub fn load() -> anyhow::Result<Config> {
+    dotenvy::dotenv().ok();
+
+    let env = std::env::var("APP_ENV")
+        .ok()
+        .and_then(|s| AppEnv::from_str(&s).ok())
+        .unwrap_or(AppEnv::Development);
+
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| anyhow::anyhow!("DATABASE_URL env var is required"))?;
+
+    let http_port = std::env::var("HTTP_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(3000);
+
+    let ses_region = std::env::var("SES_REGION").ok();
+    let ses_access_key = std::env::var("SES_ACCESS_KEY").ok();
+    let ses_secret_key = std::env::var("SES_SECRET_KEY").ok();
+
+    let apollo_api_key = std::env::var("APOLLO_API_KEY").ok();
+    let prospeo_api_key = std::env::var("PROSPEO_API_KEY").ok();
+
+    // NEW
+    let news_service_base_url = std::env::var("NEWS_SERVICE_BASE_URL").ok();
+    let news_service_api_key = std::env::var("NEWS_SERVICE_API_KEY").ok();
+
+    Ok(Config {
+        env,
+        database_url,
+        http_port,
+        ses_region,
+        ses_access_key,
+        ses_secret_key,
+        apollo_api_key,
+        prospeo_api_key,
+        news_service_base_url,
+        news_service_api_key,
+    })
 }
 
 /// Load .env base, then .env.{APP_ENV}
@@ -62,8 +102,8 @@ impl Config {
         let env_str = env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
         let env = AppEnv::from_str(&env_str).unwrap_or(AppEnv::Development);
 
-        let database_url = env::var("DATABASE_URL")
-            .map_err(|_| "DATABASE_URL env var is required")?;
+        let database_url =
+            env::var("DATABASE_URL").map_err(|_| "DATABASE_URL env var is required")?;
 
         let http_port: u16 = env::var("HTTP_PORT")
             .unwrap_or_else(|_| "3000".to_string())

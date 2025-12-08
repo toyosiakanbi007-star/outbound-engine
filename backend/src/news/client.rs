@@ -1,19 +1,14 @@
 // src/news/client.rs
 
-use std::sync::Arc;
-
-use anyhow::{anyhow, Result};
+use crate::news::models::NewsItem;
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::news::models::NewsItem;
-
-/// Request payload we send to the news sourcing service.
-///
-/// This matches the JSON contract we defined for /news/fetch.
-#[derive(Debug, Clone, Serialize)]
+/// Request we send to the news service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewsFetchRequest {
     pub client_id: Uuid,
     pub company_id: Uuid,
@@ -21,39 +16,28 @@ pub struct NewsFetchRequest {
     pub domain: String,
     pub industry: Option<String>,
     pub country: Option<String>,
-    /// Maximum number of normalized news items we want back.
     pub max_results: Option<u32>,
 }
 
-/// Response shape we expect from the news sourcing service.
-///
-/// { "company_id": "...", "news_items": [ ... ] }
-#[derive(Debug, Clone, Deserialize)]
+/// Response we expect from the news service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewsFetchResponse {
     pub company_id: Uuid,
     pub news_items: Vec<NewsItem>,
 }
 
-/// Trait that abstracts over "something that can fetch news for a company".
-///
-/// This lets you:
-/// - use an HTTP service (Lambda + API Gateway) today,
-/// - swap to another provider or local service later,
-/// - without changing worker or DB code.
 #[async_trait]
 pub trait NewsSourcingClient: Send + Sync {
     async fn fetch_news_for_company(
         &self,
         req: &NewsFetchRequest,
-    ) -> Result<Vec<NewsItem>>;
+    ) -> Result<Vec<NewsItem>, anyhow::Error>;
 }
 
-/// Convenience type alias for a trait object we can share across tasks.
-pub type DynNewsSourcingClient = Arc<dyn NewsSourcingClient + Send + Sync>;
+/// Convenient type alias for dyn client.
+pub type DynNewsSourcingClient = Arc<dyn NewsSourcingClient>;
 
-/// HTTP-based implementation of NewsSourcingClient.
-///
-/// It calls an external service with POST /news/fetch.
+/// HTTP implementation that calls an external /news/fetch endpoint.
 #[derive(Clone)]
 pub struct HttpNewsSourcingClient {
     http: reqwest::Client,
@@ -62,33 +46,24 @@ pub struct HttpNewsSourcingClient {
 }
 
 impl HttpNewsSourcingClient {
-    /// Build the client from environment variables.
-    ///
-    /// Required:
-    /// - NEWS_SERVICE_BASE_URL (e.g. "https://news-service.my-domain.com")
-    ///
-    /// Optional:
-    /// - NEWS_SERVICE_API_KEY (sent as `x-api-key` header)
-    pub fn from_env() -> Result<Self> {
-        let base_url = std::env::var("NEWS_SERVICE_BASE_URL")
-            .map_err(|_| anyhow!("NEWS_SERVICE_BASE_URL env var is required for HttpNewsSourcingClient"))?;
-
-        let api_key = std::env::var("NEWS_SERVICE_API_KEY").ok();
-
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
-
-        Ok(Self {
-            http,
+    /// Create a new client from base_url + optional API key.
+    pub fn new(base_url: String, api_key: Option<String>) -> Self {
+        Self {
+            http: reqwest::Client::new(),
             base_url,
             api_key,
-        })
+        }
     }
 
-    /// Helper to wrap this client into a shared trait object.
-    pub fn into_dyn(self) -> DynNewsSourcingClient {
-        Arc::new(self)
+    /// Create a client from optional config values.
+    /// Returns None if base_url is missing.
+    pub fn from_config(
+        base_url: Option<String>,
+        api_key: Option<String>,
+    ) -> Option<DynNewsSourcingClient> {
+        let base_url = base_url?;
+        let client = HttpNewsSourcingClient::new(base_url, api_key);
+        Some(Arc::new(client) as DynNewsSourcingClient)
     }
 }
 
@@ -97,15 +72,15 @@ impl NewsSourcingClient for HttpNewsSourcingClient {
     async fn fetch_news_for_company(
         &self,
         req: &NewsFetchRequest,
-    ) -> Result<Vec<NewsItem>> {
-        // Build URL: "<base>/news/fetch"
+    ) -> Result<Vec<NewsItem>, anyhow::Error> {
+        // Compose URL: {base_url}/news/fetch
         let url = format!("{}/news/fetch", self.base_url.trim_end_matches('/'));
 
         let mut builder = self.http.post(&url).json(req);
 
-        // Optional API key header
+        // Optional bearer token header
         if let Some(ref key) = self.api_key {
-            builder = builder.header("x-api-key", key);
+            builder = builder.header("Authorization", format!("Bearer {}", key));
         }
 
         let resp = builder.send().await?;
@@ -113,28 +88,14 @@ impl NewsSourcingClient for HttpNewsSourcingClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-
-            // 404 / 400 / 500 etc.
-            return Err(anyhow!(
-                "news service returned non-success status {}: {}",
+            return Err(anyhow::anyhow!(
+                "news service error: status={} body={}",
                 status,
                 body
             ));
         }
 
-        // Try to parse the JSON into our response struct
         let parsed: NewsFetchResponse = resp.json().await?;
-
-        // (Optional) basic sanity check
-        if parsed.company_id != req.company_id {
-            // Not fatal, but suspicious - log it if you want
-            tracing::warn!(
-                "news service returned company_id {}, but request was for {}",
-                parsed.company_id,
-                req.company_id
-            );
-        }
-
         Ok(parsed.news_items)
     }
 }

@@ -18,6 +18,9 @@ use serde_json::json;
 use std::net::SocketAddr;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+use crate::news::client::HttpNewsSourcingClient;
+use std::sync::Arc;
+
 
 #[derive(Clone)]
 pub struct AppState {
@@ -53,22 +56,31 @@ async fn main() -> config::Result<()> {
 
     // 5. Branch: server mode or worker mode
     match mode.as_str() {
-        "worker" => {
-            // Build news sourcing client from env for worker mode
-            let news_client = HttpNewsSourcingClient::from_env()?.into_dyn();
+    "worker" => {
+        // Build news client from config
+        let news_client = HttpNewsSourcingClient::from_config(
+            cfg.news_service_base_url.clone(),
+            cfg.news_service_api_key.clone(),
+        )
+        .unwrap_or_else(|| {
+            // Fallback: use a dummy client pointing to example.com
+            Arc::new(HttpNewsSourcingClient::new(
+                "https://example.com".to_string(),
+                None,
+            )) as crate::news::client::DynNewsSourcingClient
+        });
 
-            // Worker: infinite loop processing jobs
-            worker::run_worker(pool, news_client).await?;
-        }
-        _ => {
-            // Default: HTTP server
-            let state = AppState {
-                db: pool,
-                config: cfg.clone(),
-            };
-            run_server(state, cfg.http_port).await?;
-        }
+        worker::run_worker(pool, news_client).await?;
     }
+    _ => {
+        let state = AppState {
+            db: pool,
+            config: cfg.clone(),
+        };
+        run_server(state, cfg.http_port).await?;
+    }
+}
+
 
     Ok(())
 }
