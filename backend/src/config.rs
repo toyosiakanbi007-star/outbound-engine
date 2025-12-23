@@ -35,11 +35,13 @@ pub struct Config {
     pub apollo_api_key: Option<String>,
     pub prospeo_api_key: Option<String>,
 
-    // === News / signals subsystem ===
-    /// Base URL for the news sourcing service (e.g. "https://news-service.my-domain.com")
+    // News service (for /news/fetch microservice)
     pub news_service_base_url: Option<String>,
-    /// Optional API key or bearer token for the news sourcing service
     pub news_service_api_key: Option<String>,
+
+    // LLM provider selection (for future Bedrock/OpenAI/etc.)
+    // e.g. "dummy", "bedrock", "openai"
+    pub llm_provider: Option<String>,
 }
 
 /// Entry point to load configuration
@@ -83,9 +85,11 @@ impl Config {
         let apollo_api_key = env::var("APOLLO_API_KEY").ok();
         let prospeo_api_key = env::var("PROSPEO_API_KEY").ok();
 
-        // News service config
         let news_service_base_url = env::var("NEWS_SERVICE_BASE_URL").ok();
         let news_service_api_key = env::var("NEWS_SERVICE_API_KEY").ok();
+
+        // New: LLM provider selection
+        let llm_provider = env::var("LLM_PROVIDER").ok();
 
         Ok(Self {
             env,
@@ -98,6 +102,7 @@ impl Config {
             prospeo_api_key,
             news_service_base_url,
             news_service_api_key,
+            llm_provider,
         })
     }
 }

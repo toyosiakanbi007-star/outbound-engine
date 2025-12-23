@@ -3,7 +3,7 @@ mod db;
 mod jobs;
 mod news;
 mod routes;
-mod worker; // <-- add this line
+mod worker;
 
 use crate::news::client::HttpNewsSourcingClient;
 use axum::{
@@ -17,6 +17,7 @@ use db::DbPool;
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -61,9 +62,8 @@ async fn main() -> config::Result<()> {
                 cfg.news_service_api_key.clone(),
             )
             .unwrap_or_else(|| {
-                // Fallback: use a dummy client pointing to example.com
                 Arc::new(HttpNewsSourcingClient::new(
-                    "https://example.com".to_string(),
+                    "http://127.0.0.1:3000".to_string(),
                     None,
                 )) as crate::news::client::DynNewsSourcingClient
             });
@@ -84,21 +84,30 @@ async fn main() -> config::Result<()> {
 
 // ========== Server mode ==========
 
-async fn run_server(state: AppState, http_port: u16) -> config::Result<()> {
+async fn run_server(
+    state: AppState,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = Router::new()
         .route("/health", get(health_handler))
-        .route("/version", get(version_handler))
         .route("/db-health", get(db_health_handler))
+        .route("/version", get(version_handler))
         .route(
             "/debug/jobs/test-send",
             post(routes::debug::create_test_send_job_handler),
         )
-        .with_state(state.clone());
+        // Mock news endpoint for Checklist 7
+        .route(
+            "/news/fetch",
+            post(routes::news::mock_fetch_news_handler),
+        )
+        .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], http_port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("HTTP server listening on http://{}", addr);
 
-    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
+    let listener = TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
