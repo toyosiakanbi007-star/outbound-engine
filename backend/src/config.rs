@@ -35,7 +35,9 @@ pub struct Config {
     pub apollo_api_key: Option<String>,
     pub prospeo_api_key: Option<String>,
 
-    // News service (for /news/fetch microservice)
+    // Optional HTTP news service (for local/mock /news/fetch microservice).
+    // In production we now prefer direct Lambda invocation via NEWS_LAMBDA_FUNCTION_NAME,
+    // which is read directly in news::client::build_news_client (not stored here).
     pub news_service_base_url: Option<String>,
     pub news_service_api_key: Option<String>,
 
@@ -88,7 +90,7 @@ impl Config {
         let news_service_base_url = env::var("NEWS_SERVICE_BASE_URL").ok();
         let news_service_api_key = env::var("NEWS_SERVICE_API_KEY").ok();
 
-        // New: LLM provider selection
+        // Optional: which LLM provider the system should use (future hook)
         let llm_provider = env::var("LLM_PROVIDER").ok();
 
         Ok(Self {

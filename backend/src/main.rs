@@ -1,3 +1,5 @@
+// src/main.rs
+
 mod config;
 mod db;
 mod jobs;
@@ -5,7 +7,7 @@ mod news;
 mod routes;
 mod worker;
 
-use crate::news::client::HttpNewsSourcingClient;
+use crate::news::client::build_news_client;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -16,7 +18,6 @@ use config::Config;
 use db::DbPool;
 use serde_json::json;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -56,18 +57,8 @@ async fn main() -> config::Result<()> {
     // 5. Branch: server mode or worker mode
     match mode.as_str() {
         "worker" => {
-            // Build news client from config
-            let news_client = HttpNewsSourcingClient::from_config(
-                cfg.news_service_base_url.clone(),
-                cfg.news_service_api_key.clone(),
-            )
-            .unwrap_or_else(|| {
-                Arc::new(HttpNewsSourcingClient::new(
-                    "http://127.0.0.1:3000".to_string(),
-                    None,
-                )) as crate::news::client::DynNewsSourcingClient
-            });
-
+            // Build Lambda or Noop news client from env/config
+            let news_client = build_news_client(&cfg).await?;
             worker::run_worker(pool, news_client).await?;
         }
         _ => {
@@ -96,7 +87,7 @@ async fn run_server(
             "/debug/jobs/test-send",
             post(routes::debug::create_test_send_job_handler),
         )
-        // Mock news endpoint for Checklist 7
+        // Still keep the mock news endpoint for local/manual tests if you want
         .route(
             "/news/fetch",
             post(routes::news::mock_fetch_news_handler),

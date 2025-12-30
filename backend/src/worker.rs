@@ -109,7 +109,6 @@ pub async fn process_job(
                 "Unknown job_type '{}' for job {} ({}) , marking as failed",
                 job.job_type, job.id, err
             );
-            // Keep the same behavior: mark as failed and return Ok(())
             mark_job_failed(pool, job.id, worker_id, "unknown job_type").await?;
             return Ok(());
         }
@@ -121,35 +120,35 @@ pub async fn process_job(
                 "Worker {} handling job {} of type DISCOVER_PROSPECTS",
                 worker_id, job.id
             );
-            // TODO: actual business logic for DiscoverProspects
+            // TODO: real logic
         }
         JobType::EnrichLeads => {
             info!(
                 "Worker {} handling job {} of type ENRICH_LEADS",
                 worker_id, job.id
             );
-            // TODO: actual business logic for EnrichLeads
+            // TODO: real logic
         }
         JobType::AiPersonalize => {
             info!(
                 "Worker {} handling job {} of type AI_PERSONALIZE",
                 worker_id, job.id
             );
-            // TODO: actual business logic for AiPersonalize
+            // TODO: real logic
         }
         JobType::SendEmails => {
             info!(
                 "Worker {} handling job {} of type SEND_EMAILS",
                 worker_id, job.id
             );
-            // TODO: actual business logic for SendEmails
+            // TODO: real logic
         }
         JobType::ClientAcquisitionOutreach => {
             info!(
                 "Worker {} handling job {} of type CLIENT_ACQUISITION_OUTREACH",
                 worker_id, job.id
             );
-            // TODO: actual business logic for ClientAcquisitionOutreach
+            // TODO: real logic
         }
         JobType::FetchNews => {
             info!(
@@ -157,19 +156,18 @@ pub async fn process_job(
                 worker_id, job.id
             );
 
-            // Call the real handler that talks to the news service and writes to DB.
             if let Err(e) = handle_fetch_news_job(pool, job, worker_id, news_client).await {
                 warn!(
                     "Worker {}: error while handling FETCH_NEWS job {}: {:?}",
                     worker_id, job.id, e
                 );
-                // Bubble up DB errors so caller can mark job failed
+                // Bubble DB errors up so the caller can mark job failed
                 return Err(e);
             }
         }
     }
 
-    // For now we just mark the job as done after handler runs successfully.
+    // After handler runs successfully, mark job as done.
     mark_job_done(pool, job.id).await?;
 
     Ok(())
@@ -246,10 +244,10 @@ async fn handle_fetch_news_job(
     let company = match company {
         Some(c) => c,
         None => {
-            warn!(
+            warn! {
                 "Worker {}: FETCH_NEWS job {} refers to missing company_id={} / client_id={}",
                 worker_id, job.id, payload.company_id, payload.client_id
-            );
+            };
             return Ok(());
         }
     };
@@ -265,7 +263,7 @@ async fn handle_fetch_news_job(
         max_results: payload.max_results,
     };
 
-    // 4) Call the news service
+    // 4) Call the news service (Lambda)
     let items_res = news_client.fetch_news_for_company(&req).await;
 
     let items: Vec<NewsItem> = match items_res {
