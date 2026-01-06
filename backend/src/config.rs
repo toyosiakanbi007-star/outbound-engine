@@ -35,14 +35,23 @@ pub struct Config {
     pub apollo_api_key: Option<String>,
     pub prospeo_api_key: Option<String>,
 
-    // Optional HTTP news service (for local/mock /news/fetch microservice).
-    // In production we now prefer direct Lambda invocation via NEWS_LAMBDA_FUNCTION_NAME,
-    // which is read directly in news::client::build_news_client (not stored here).
+    /// Optional HTTP news service endpoint.
+    ///
+    /// Can be:
+    /// - A local dev microservice (e.g. http://localhost:4000/news/fetch)
+    /// - An Azure Function URL (e.g. https://xxx.azurewebsites.net/api/news-fetch)
+    ///
+    /// In production, we *prefer* direct Lambda invocation via `NEWS_LAMBDA_FUNCTION_NAME`,
+    /// but if `NEWS_AZURE_FUNCTION_URL` (env) or this value is set, the
+    /// Azure HTTP client will be used instead.
     pub news_service_base_url: Option<String>,
+
+    /// Optional API key/header credential for the HTTP news service
+    /// (e.g. Azure Functions key, local auth token, etc.).
     pub news_service_api_key: Option<String>,
 
-    // LLM provider selection (for future Bedrock/OpenAI/etc.)
-    // e.g. "dummy", "bedrock", "openai"
+    /// LLM provider selection (future hook for orchestration).
+    /// Examples: "dummy", "bedrock", "openai", "deepseek", etc.
     pub llm_provider: Option<String>,
 }
 
@@ -87,6 +96,8 @@ impl Config {
         let apollo_api_key = env::var("APOLLO_API_KEY").ok();
         let prospeo_api_key = env::var("PROSPEO_API_KEY").ok();
 
+        // Generic “HTTP news service” config (used by AzureHttpNewsSourcingClient as fallback
+        // if NEWS_AZURE_FUNCTION_URL is not set).
         let news_service_base_url = env::var("NEWS_SERVICE_BASE_URL").ok();
         let news_service_api_key = env::var("NEWS_SERVICE_API_KEY").ok();
 

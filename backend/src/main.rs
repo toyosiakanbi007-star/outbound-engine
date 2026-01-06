@@ -57,7 +57,10 @@ async fn main() -> config::Result<()> {
     // 5. Branch: server mode or worker mode
     match mode.as_str() {
         "worker" => {
-            // Build Lambda or Noop news client from env/config
+            // Build news client from env/config:
+            // - AWS Lambda (NEWS_LAMBDA_FUNCTION_NAME set), OR
+            // - Azure HTTP function / generic HTTP (NEWS_AZURE_FUNCTION_URL / NEWS_SERVICE_BASE_URL), OR
+            // - Noop client (logs, returns 0 items).
             let news_client = build_news_client(&cfg).await?;
             worker::run_worker(pool, news_client).await?;
         }
@@ -87,11 +90,10 @@ async fn run_server(
             "/debug/jobs/test-send",
             post(routes::debug::create_test_send_job_handler),
         )
-        // Still keep the mock news endpoint for local/manual tests if you want
-        .route(
-            "/news/fetch",
-            post(routes::news::mock_fetch_news_handler),
-        )
+        // Still keep the mock news endpoint for local/manual tests if you want.
+        // The real news pipeline for workers goes through NewsSourcingClient (AWS/Azure),
+        // this endpoint is just for dev/manual inspection.
+        .route("/news/fetch", post(routes::news::mock_fetch_news_handler))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

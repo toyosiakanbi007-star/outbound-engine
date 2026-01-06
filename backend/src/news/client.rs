@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use aws_config;
 use aws_sdk_lambda::{primitives::Blob, Client as LambdaClient};
 use chrono::{DateTime, NaiveDate, Utc};
+use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-/// Request we send to the news service Lambda (matches what we POST from Rust).
+/// Request we send to the news service (Lambda or Azure HTTP).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewsFetchRequest {
     pub client_id: Uuid,
@@ -34,8 +35,8 @@ pub struct NewsFetchResponse {
     pub news_items: Vec<NewsItem>,
 }
 
-/// Raw item as returned by Lambda JSON (wire format).
-/// NOTE: `date` is a String here to match the Lambda payload.
+/// Raw item as returned by the news microservice JSON (wire format).
+/// NOTE: `date` is a String here to match the Lambda/Azure payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RawNewsItem {
     pub company_id: Uuid,
@@ -50,7 +51,7 @@ struct RawNewsItem {
     pub confidence: f32,
 }
 
-/// Raw response shape from Lambda.
+/// Raw response shape from the news microservice.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RawNewsFetchResponse {
     pub company_id: Uuid,
@@ -61,6 +62,9 @@ struct RawNewsFetchResponse {
 pub enum NewsError {
     #[error("lambda error: {0}")]
     Lambda(String),
+
+    #[error("http error: {0}")]
+    Http(String),
 
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
@@ -96,7 +100,25 @@ impl LambdaNewsSourcingClient {
     }
 }
 
-/// No-op client used when Lambda is not configured (returns zero news).
+/// Azure HTTP-based implementation that calls an Azure Function / HTTP endpoint.
+#[derive(Clone)]
+pub struct AzureHttpNewsSourcingClient {
+    http: HttpClient,
+    base_url: String,
+    api_key: Option<String>,
+}
+
+impl AzureHttpNewsSourcingClient {
+    pub fn new(http: HttpClient, base_url: String, api_key: Option<String>) -> Self {
+        Self {
+            http,
+            base_url,
+            api_key,
+        }
+    }
+}
+
+/// No-op client used when no backend is configured (returns zero news).
 #[derive(Clone)]
 pub struct NoopNewsSourcingClient;
 
@@ -118,9 +140,30 @@ impl NewsSourcingClient for NoopNewsSourcingClient {
 
 /// Build the news client from config + environment.
 ///
-/// If `NEWS_LAMBDA_FUNCTION_NAME` is set -> use Lambda client  
-/// Otherwise -> use Noop client (worker will log “no news” and continue)
-pub async fn build_news_client(_cfg: &Config) -> Result<DynNewsSourcingClient, NewsError> {
+/// Precedence:
+/// 1. If `NEWS_AZURE_FUNCTION_URL` (or `Config.news_service_base_url`) is set -> Azure HTTP client
+/// 2. Else if `NEWS_LAMBDA_FUNCTION_NAME` is set -> Lambda client
+/// 3. Else -> Noop client (worker will log “no news” and continue)
+pub async fn build_news_client(cfg: &Config) -> Result<DynNewsSourcingClient, NewsError> {
+    // --- 1) Azure HTTP function? ---
+    // Env takes precedence; fall back to config.news_service_base_url / _api_key.
+    let azure_url_env = std::env::var("NEWS_AZURE_FUNCTION_URL").ok();
+    let azure_key_env = std::env::var("NEWS_AZURE_FUNCTION_KEY").ok();
+
+    let azure_url = azure_url_env.or_else(|| cfg.news_service_base_url.clone());
+    let azure_key = azure_key_env.or_else(|| cfg.news_service_api_key.clone());
+
+    if let Some(base_url) = azure_url {
+        info!(
+            "Initializing AzureHttpNewsSourcingClient with base_url={}",
+            base_url
+        );
+        let http = HttpClient::new();
+        let client = AzureHttpNewsSourcingClient::new(http, base_url, azure_key);
+        return Ok(Arc::new(client) as DynNewsSourcingClient);
+    }
+
+    // --- 2) AWS Lambda? ---
     if let Ok(function_name) = std::env::var("NEWS_LAMBDA_FUNCTION_NAME") {
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
         info!(
@@ -131,11 +174,15 @@ pub async fn build_news_client(_cfg: &Config) -> Result<DynNewsSourcingClient, N
         let conf = aws_config::load_from_env().await;
         let client = LambdaClient::new(&conf);
         let lambda_client = LambdaNewsSourcingClient::new(client, function_name);
-        Ok(Arc::new(lambda_client) as DynNewsSourcingClient)
-    } else {
-        warn!("NEWS_LAMBDA_FUNCTION_NAME not set; using NoopNewsSourcingClient (no news will be fetched)");
-        Ok(Arc::new(NoopNewsSourcingClient::new()) as DynNewsSourcingClient)
+        return Ok(Arc::new(lambda_client) as DynNewsSourcingClient);
     }
+
+    // --- 3) Fallback: Noop client ---
+    warn!(
+        "No NEWS_AZURE_FUNCTION_URL / NEWS_LAMBDA_FUNCTION_NAME configured; \
+         using NoopNewsSourcingClient (no news will be fetched)"
+    );
+    Ok(Arc::new(NoopNewsSourcingClient::new()) as DynNewsSourcingClient)
 }
 
 #[async_trait]
@@ -175,71 +222,73 @@ impl NewsSourcingClient for LambdaNewsSourcingClient {
             raw_str
         );
 
-        // Helper: map RawNewsFetchResponse -> Vec<NewsItem>
-        fn map_raw_response(raw: RawNewsFetchResponse) -> Vec<NewsItem> {
-            raw.news_items
-                .into_iter()
-                .map(|r| RawNewsItem::into_news_item(r))
-                .collect()
-        }
-
-        // ---- Primary parse path: direct raw response ----
-        if let Ok(parsed) = serde_json::from_slice::<RawNewsFetchResponse>(&raw_bytes) {
-            return Ok(map_raw_response(parsed));
-        }
-
-        warn!(
-            target: "backend::news::client",
-            "failed to parse lambda payload as RawNewsFetchResponse directly; trying wrapper/body fallbacks"
-        );
-
-        // ---- Fallback 1: parse as generic Value, handle wrappers ----
-        if let Ok(v) = serde_json::from_str::<Value>(&raw_str) {
-            // Case 1: already looks like { company_id, news_items }
-            if v.get("company_id").is_some() && v.get("news_items").is_some() {
-                if let Ok(parsed) = serde_json::from_value::<RawNewsFetchResponse>(v.clone()) {
-                    return Ok(map_raw_response(parsed));
-                }
-            }
-
-            // Case 2: API Gateway style: { statusCode, body: "<json string>" }
-            if let Some(body) = v.get("body") {
-                if let Some(body_str) = body.as_str() {
-                    info!(
-                        target: "backend::news::client",
-                        "news lambda wrapper body string: {}",
-                        body_str
-                    );
-                    if let Ok(parsed) = serde_json::from_str::<RawNewsFetchResponse>(body_str) {
-                        return Ok(map_raw_response(parsed));
-                    }
-                }
-            }
-        }
-
-        // ---- Fallback 2: trim at last closing brace (in case of trailing junk) ----
-        if let Some(pos) = raw_str.rfind('}') {
-            let trimmed = &raw_str[..=pos];
-            if let Ok(parsed) = serde_json::from_str::<RawNewsFetchResponse>(trimmed) {
-                warn!(
-                    target: "backend::news::client",
-                    "parsed lambda payload successfully after trimming trailing data"
-                );
-                return Ok(map_raw_response(parsed));
-            }
-        }
-
-        // ---- If everything fails, log and treat as no items ----
-        warn!(
-            target: "backend::news::client",
-            "all attempts to parse lambda payload failed; treating as 0 items"
-        );
-
-        Ok(vec![])
+        // Shared parse logic
+        let items = parse_news_items_from_bytes(&raw_bytes, &raw_str);
+        Ok(items)
     }
 }
 
-/// Helper: convert wire/raw item into internal NewsItem, with flexible date parsing.
+#[async_trait]
+impl NewsSourcingClient for AzureHttpNewsSourcingClient {
+    async fn fetch_news_for_company(
+        &self,
+        req: &NewsFetchRequest,
+    ) -> Result<Vec<NewsItem>, NewsError> {
+        // Treat base_url as the full function URL.
+        let url = self.base_url.trim_end_matches('/').to_string();
+
+        let mut request_builder = self.http.post(&url).json(req);
+
+        // Azure Function key, if any (standard header).
+        if let Some(ref key) = self.api_key {
+            request_builder = request_builder.header("x-functions-key", key);
+        }
+
+        let resp = request_builder
+            .send()
+            .await
+            .map_err(|e| NewsError::Http(e.to_string()))?;
+
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| NewsError::Http(e.to_string()))?;
+        let raw_bytes = bytes.to_vec();
+
+        if !status.is_success() {
+            let body_str = String::from_utf8_lossy(&raw_bytes);
+            warn!(
+                target: "backend::news::client",
+                "Azure news function returned non-success status={} body={}",
+                status,
+                body_str
+            );
+            return Err(NewsError::Http(format!(
+                "Azure function status={} body={}",
+                status, body_str
+            )));
+        }
+
+        if raw_bytes.is_empty() {
+            warn!("Azure news function returned empty payload");
+            return Ok(vec![]);
+        }
+
+        let raw_str = String::from_utf8(raw_bytes.clone())?;
+        info!(
+            target: "backend::news::client",
+            "Azure news function raw payload: {}",
+            raw_str
+        );
+
+        // Shared parse logic
+        let items = parse_news_items_from_bytes(&raw_bytes, &raw_str);
+        Ok(items)
+    }
+}
+
+/// Shared helper: convert wire/raw item into internal NewsItem, with flexible date parsing.
 impl RawNewsItem {
     fn into_news_item(self) -> NewsItem {
         let parsed_date = self
@@ -278,4 +327,73 @@ fn parse_flexible_date(s: &str) -> Option<DateTime<Utc>> {
     }
 
     None
+}
+
+/// Shared parsing logic used by both Lambda and Azure HTTP clients.
+///
+/// Tries several shapes:
+/// - direct `RawNewsFetchResponse`
+/// - wrapper with `body` string (API Gateway-style)
+/// - trimmed-at-last-`}` in case of trailing junk
+fn parse_news_items_from_bytes(raw_bytes: &[u8], raw_str: &str) -> Vec<NewsItem> {
+    // Local helper: map RawNewsFetchResponse -> Vec<NewsItem>
+    fn map_raw_response(raw: RawNewsFetchResponse) -> Vec<NewsItem> {
+        raw.news_items
+            .into_iter()
+            .map(RawNewsItem::into_news_item)
+            .collect()
+    }
+
+    // ---- Primary parse path: direct raw response ----
+    if let Ok(parsed) = serde_json::from_slice::<RawNewsFetchResponse>(raw_bytes) {
+        return map_raw_response(parsed);
+    }
+
+    warn!(
+        target: "backend::news::client",
+        "failed to parse payload as RawNewsFetchResponse directly; trying wrapper/body fallbacks"
+    );
+
+    // ---- Fallback 1: parse as generic Value, handle wrappers ----
+    if let Ok(v) = serde_json::from_str::<Value>(raw_str) {
+        // Case 1: already looks like { company_id, news_items }
+        if v.get("company_id").is_some() && v.get("news_items").is_some() {
+            if let Ok(parsed) = serde_json::from_value::<RawNewsFetchResponse>(v.clone()) {
+                return map_raw_response(parsed);
+            }
+        }
+
+        // Case 2: API Gateway style: { statusCode, body: "<json string>" }
+        if let Some(body) = v.get("body") {
+            if let Some(body_str) = body.as_str() {
+                info!(
+                    target: "backend::news::client",
+                    "news wrapper body string: {}",
+                    body_str
+                );
+                if let Ok(parsed) = serde_json::from_str::<RawNewsFetchResponse>(body_str) {
+                    return map_raw_response(parsed);
+                }
+            }
+        }
+    }
+
+    // ---- Fallback 2: trim at last closing brace (in case of trailing junk) ----
+    if let Some(pos) = raw_str.rfind('}') {
+        let trimmed = &raw_str[..=pos];
+        if let Ok(parsed) = serde_json::from_str::<RawNewsFetchResponse>(trimmed) {
+            warn!(
+                target: "backend::news::client",
+                "parsed payload successfully after trimming trailing data"
+            );
+            return map_raw_response(parsed);
+        }
+    }
+
+    // ---- If everything fails, log and treat as no items ----
+    warn!(
+        target: "backend::news::client",
+        "all attempts to parse news payload failed; treating as 0 items"
+    );
+    Vec::new()
 }
