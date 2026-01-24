@@ -52,3 +52,5 @@ thiserror = "1.0"
 # - safe to keep even if you run only on Azure (just not used at runtime)
 aws-config = "1"
 aws-sdk-lambda = "1"
+lazy_static = "1.4"
+

@@ -5,8 +5,17 @@ use crate::jobs::models::{Job, JobStatus, JobType};
 use crate::news::client::{DynNewsSourcingClient, NewsFetchRequest};
 use crate::news::models::NewsItem;
 
+// V3: Import Phase B handlers
+use crate::jobs::{
+    handle_analyze_employee_metrics, AnalyzeEmployeeMetricsPayload,
+    handle_analyze_funding_events, AnalyzeFundingEventsPayload,
+    handle_phase_b_enrich, PhaseBPayload,
+};
+
+use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use sqlx::{self, Error};
+use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -15,6 +24,14 @@ use uuid::Uuid;
 /// Called when MODE=worker; runs an infinite loop.
 pub async fn run_worker(pool: DbPool, news_client: DynNewsSourcingClient) -> anyhow::Result<()> {
     let worker_id = std::env::var("WORKER_ID").unwrap_or_else(|_| "worker-1".to_string());
+
+    // V3: Create HTTP client for Apollo API + Azure Function calls
+    let http_client = Arc::new(
+        HttpClient::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .expect("Failed to create HTTP client")
+    );
 
     tracing::info!(
         target: "backend::worker",
@@ -26,7 +43,7 @@ pub async fn run_worker(pool: DbPool, news_client: DynNewsSourcingClient) -> any
     loop {
         match fetch_next_job(&pool, &worker_id).await {
             Ok(Some(job)) => {
-                if let Err(err) = process_job(&pool, &job, &worker_id, &news_client).await {
+                if let Err(err) = process_job(&pool, &job, &worker_id, &news_client, &http_client).await {
                     error!("Error while processing job {}: {:?}", job.id, err);
 
                     if let Err(e) =
@@ -100,6 +117,7 @@ pub async fn process_job(
     job: &Job,
     worker_id: &str,
     news_client: &DynNewsSourcingClient,
+    http_client: &Arc<HttpClient>,  // V3: Added HTTP client
 ) -> Result<(), Error> {
     // Parse DB job_type string -> JobType enum
     let job_type = match job.job_type_enum() {
@@ -163,6 +181,123 @@ pub async fn process_job(
                 );
                 // Bubble DB errors up so the caller can mark job failed
                 return Err(e);
+            }
+        }
+        
+        // =====================================================
+        // V3: Phase B Job Handlers
+        // =====================================================
+        
+        JobType::PhaseBEnrichApollo => {
+            info!(
+                "Worker {} handling job {} of type PHASE_B_ENRICH_APOLLO",
+                worker_id, job.id
+            );
+            
+            let payload: PhaseBPayload = match serde_json::from_value(job.payload.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        "Worker {}: invalid PHASE_B_ENRICH_APOLLO payload for job {}: {}",
+                        worker_id, job.id, e
+                    );
+                    mark_job_failed(pool, job.id, worker_id, &format!("invalid payload: {}", e)).await?;
+                    return Ok(());
+                }
+            };
+            
+            match handle_phase_b_enrich(pool, http_client.as_ref(), &payload, worker_id).await {
+                Ok(result) => {
+                    info!(
+                        "Worker {}: Phase B complete for company {} (hypotheses={})",
+                        worker_id,
+                        payload.company_id,
+                        result.get("pain_hypotheses")
+                            .and_then(|h| h.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0)
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Worker {}: Phase B failed for company {}: {:?}",
+                        worker_id, payload.company_id, e
+                    );
+                    mark_job_failed(pool, job.id, worker_id, &format!("{:?}", e)).await?;
+                    return Ok(());
+                }
+            }
+        }
+        
+        JobType::AnalyzeEmployeeMetrics => {
+            info!(
+                "Worker {} handling job {} of type ANALYZE_EMPLOYEE_METRICS",
+                worker_id, job.id
+            );
+            
+            let payload: AnalyzeEmployeeMetricsPayload = match serde_json::from_value(job.payload.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        "Worker {}: invalid ANALYZE_EMPLOYEE_METRICS payload for job {}: {}",
+                        worker_id, job.id, e
+                    );
+                    mark_job_failed(pool, job.id, worker_id, &format!("invalid payload: {}", e)).await?;
+                    return Ok(());
+                }
+            };
+            
+            match handle_analyze_employee_metrics(pool, &payload, worker_id).await {
+                Ok(analysis) => {
+                    info!(
+                        "Worker {}: Employee metrics analysis complete for company {} (growth_90d={:?})",
+                        worker_id, payload.company_id, analysis.headcount_growth_rate_90d
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Worker {}: Employee metrics analysis failed for company {}: {:?}",
+                        worker_id, payload.company_id, e
+                    );
+                    mark_job_failed(pool, job.id, worker_id, &format!("{:?}", e)).await?;
+                    return Ok(());
+                }
+            }
+        }
+        
+        JobType::AnalyzeFundingEvents => {
+            info!(
+                "Worker {} handling job {} of type ANALYZE_FUNDING_EVENTS",
+                worker_id, job.id
+            );
+            
+            let payload: AnalyzeFundingEventsPayload = match serde_json::from_value(job.payload.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        "Worker {}: invalid ANALYZE_FUNDING_EVENTS payload for job {}: {}",
+                        worker_id, job.id, e
+                    );
+                    mark_job_failed(pool, job.id, worker_id, &format!("invalid payload: {}", e)).await?;
+                    return Ok(());
+                }
+            };
+            
+            match handle_analyze_funding_events(pool, &payload, worker_id).await {
+                Ok(analysis) => {
+                    info!(
+                        "Worker {}: Funding analysis complete for company {} (total={}, stage={})",
+                        worker_id, payload.company_id, analysis.total_raised_formatted, analysis.stage
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Worker {}: Funding analysis failed for company {}: {:?}",
+                        worker_id, payload.company_id, e
+                    );
+                    mark_job_failed(pool, job.id, worker_id, &format!("{:?}", e)).await?;
+                    return Ok(());
+                }
             }
         }
     }

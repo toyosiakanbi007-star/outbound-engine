@@ -1,3 +1,5 @@
+// src/jobs/models.rs
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
@@ -14,24 +16,36 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobType {
+    // Existing job types
     DiscoverProspects,
     EnrichLeads,
     AiPersonalize,
     SendEmails,
     ClientAcquisitionOutreach,
     FetchNews,
+    
+    // V3: Phase B job types
+    PhaseBEnrichApollo,
+    AnalyzeEmployeeMetrics,
+    AnalyzeFundingEvents,
 }
 
 impl JobType {
     /// Canonical DB / JSON representation.
     pub fn as_str(&self) -> &'static str {
         match self {
+            // Existing
             JobType::DiscoverProspects => "discover_prospects",
             JobType::EnrichLeads => "enrich_leads",
             JobType::AiPersonalize => "ai_personalize",
             JobType::SendEmails => "send_emails",
             JobType::ClientAcquisitionOutreach => "client_acquisition_outreach",
             JobType::FetchNews => "fetch_news",
+            
+            // V3: Phase B
+            JobType::PhaseBEnrichApollo => "phase_b_enrich_apollo",
+            JobType::AnalyzeEmployeeMetrics => "analyze_employee_metrics",
+            JobType::AnalyzeFundingEvents => "analyze_funding_events",
         }
     }
 }
@@ -52,6 +66,11 @@ impl FromStr for JobType {
             "send_emails" => Ok(JobType::SendEmails),
             "client_acquisition_outreach" => Ok(JobType::ClientAcquisitionOutreach),
             "fetch_news" => Ok(JobType::FetchNews),
+            
+            // V3: Phase B (snake_case)
+            "phase_b_enrich_apollo" => Ok(JobType::PhaseBEnrichApollo),
+            "analyze_employee_metrics" => Ok(JobType::AnalyzeEmployeeMetrics),
+            "analyze_funding_events" => Ok(JobType::AnalyzeFundingEvents),
 
             // optional: legacy UPPER_CASE support
             "DISCOVER_PROSPECTS" => Ok(JobType::DiscoverProspects),
@@ -60,6 +79,11 @@ impl FromStr for JobType {
             "SEND_EMAILS" => Ok(JobType::SendEmails),
             "CLIENT_ACQUISITION_OUTREACH" => Ok(JobType::ClientAcquisitionOutreach),
             "FETCH_NEWS" => Ok(JobType::FetchNews),
+            
+            // V3: Phase B (UPPER_CASE)
+            "PHASE_B_ENRICH_APOLLO" => Ok(JobType::PhaseBEnrichApollo),
+            "ANALYZE_EMPLOYEE_METRICS" => Ok(JobType::AnalyzeEmployeeMetrics),
+            "ANALYZE_FUNDING_EVENTS" => Ok(JobType::AnalyzeFundingEvents),
 
             other => Err(format!("Unknown job_type: {}", other)),
         }

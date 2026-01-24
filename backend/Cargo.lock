@@ -584,6 +584,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "home",
+ "lazy_static",
  "reqwest",
  "serde",
  "serde_json",
