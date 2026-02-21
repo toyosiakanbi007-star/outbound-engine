@@ -8,6 +8,7 @@
 // - First need to search for org ID using domain if not cached
 // - Trigger employee metrics and funding analysis
 // - Call Azure Function with mode="aggregate" to generate final hypotheses
+// - Store aggregate results in aggregate_results table
 //
 // APOLLO API:
 // - Organization Search: POST /api/v1/organizations/search (to get org ID from domain)
@@ -21,8 +22,17 @@
 // 5. Store enrichment in company_apollo_enrichment
 // 6. Run ANALYZE_EMPLOYEE_METRICS
 // 7. Run ANALYZE_FUNDING_EVENTS
-// 8. HTTP call Azure Function with mode="aggregate"
-// 9. Store aggregated results
+// 8. Load V3 prequal data (v3_hypotheses, v3_evidence, v3_analysis_runs)
+// 9. Load Phase 0 offer-fit result (if available)
+// 10. HTTP call Azure Function with mode="aggregate"
+// 11. Store aggregated results in aggregate_results table
+// 12. Update v3_analysis_runs with aggregate status
+//
+// V3 CHANGES:
+// - Uses v3_hypotheses, v3_evidence, v3_analysis_runs tables instead of V2 tables
+// - AggregateRequest now uses prequal_output structure matching aggregator_v3.py
+// - Stores results in aggregate_results table
+// - Includes Phase 0 ICP decision in aggregate request
 
 use chrono::{DateTime, Utc};
 use reqwest::Client;
@@ -158,21 +168,50 @@ pub struct ApolloOrganization {
     pub keywords: Vec<String>,
 }
 
-/// Azure Function aggregate request
+/// Azure Function aggregate request (V3 format)
+/// 
+/// This structure matches what aggregator_v3.py expects in run_aggregator()
 #[derive(Debug, Clone, Serialize)]
 pub struct AggregateRequest {
     pub client_id: Uuid,
     pub company_id: Uuid,
     pub company_name: String,
     pub domain: String,
-    pub mode: String,
+    pub mode: String,  // "aggregate"
     pub run_id: Uuid,
-    pub prequal_hypotheses: Vec<JsonValue>,
-    pub prequal_evidence: Vec<JsonValue>,
+    
+    // V3: Full prequal output structure (matches aggregator_v3.py expectations)
+    pub prequal_output: JsonValue,  // Contains: analysis_run, hypotheses, evidence
+    
+    // Apollo enrichment data
     pub apollo_enrichment: JsonValue,
     pub employee_metrics_analysis: JsonValue,
     pub funding_analysis: JsonValue,
+    
+    // Client context (ICP profile, tech preferences, offer)
     pub client_context: JsonValue,
+    
+    // Optional: Phase 0 ICP result if available
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase0_icp: Option<JsonValue>,
+}
+
+/// Aggregate result from Azure Function (for storing)
+#[derive(Debug, Clone, Deserialize)]
+pub struct AggregateResultResponse {
+    pub final_score: Option<f64>,
+    pub tier: Option<String>,
+    pub qualifies: Option<bool>,
+    pub do_not_outreach: Option<bool>,
+    pub needs_review: Option<bool>,
+    pub score_breakdown: Option<JsonValue>,
+    pub unified_hypotheses: Option<Vec<JsonValue>>,
+    pub tech_context: Option<JsonValue>,
+    pub final_offer_fit: Option<JsonValue>,
+    pub contact_suggestions: Option<JsonValue>,
+    pub decision_notes: Option<Vec<String>>,
+    #[serde(rename = "_meta")]
+    pub meta: Option<JsonValue>,
 }
 
 // ----------------------------
@@ -359,26 +398,47 @@ pub async fn store_apollo_enrichment(
     Ok(())
 }
 
-/// Load prequal data for aggregate request
-pub async fn load_prequal_data(
+/// Load V3 prequal data for aggregate request
+/// 
+/// Returns: (hypotheses, evidence, analysis_run)
+/// Uses V3 tables: v3_hypotheses, v3_evidence, v3_analysis_runs
+pub async fn load_prequal_data_v3(
     pool: &PgPool,
     company_id: Uuid,
     run_id: Uuid,
-) -> Result<(Vec<JsonValue>, Vec<JsonValue>), sqlx::Error> {
-    // Load hypotheses
+) -> Result<(Vec<JsonValue>, Vec<JsonValue>, Option<JsonValue>), sqlx::Error> {
+    // Load V3 hypotheses with full confidence breakdown
     let hypotheses: Vec<(JsonValue,)> = sqlx::query_as(
         r#"
         SELECT json_build_object(
+            'id', id,
             'hypothesis', hypothesis,
-            'why_now', why_now,
             'pain_category', pain_category,
+            'pain_type', pain_type,
             'pain_subtags', pain_subtags,
+            'raw_confidence', raw_confidence,
+            'staleness_penalty', staleness_penalty,
+            'corroboration_penalty', corroboration_penalty,
+            'final_confidence', final_confidence,
+            'corroborated', corroborated,
+            'corroborated_by', corroborated_by,
+            'corroboration_needed', corroboration_needed,
+            'why_now_text', why_now_text,
+            'why_now_type', why_now_type,
+            'why_now_date', why_now_date,
+            'why_now_days_until', why_now_days_until,
+            'why_now_urgency', why_now_urgency,
             'evidence', evidence,
-            'confidence', confidence,
+            'evidence_summary', evidence_summary,
+            'offer_fit_strength', offer_fit_strength,
+            'do_not_outreach', do_not_outreach,
+            'recommended_personas', recommended_personas,
+            'suggested_offer_fit', suggested_offer_fit,
             'strength', strength
         )
-        FROM company_pain_hypotheses
+        FROM v3_hypotheses
         WHERE company_id = $1 AND run_id = $2
+        ORDER BY final_confidence DESC
         "#,
     )
     .bind(company_id)
@@ -386,45 +446,165 @@ pub async fn load_prequal_data(
     .fetch_all(pool)
     .await?;
     
-    // Load evidence
+    // Load V3 evidence with date/tier info
     let evidence: Vec<(JsonValue,)> = sqlx::query_as(
         r#"
         SELECT json_build_object(
+            'id', id,
             'url', url,
-            'snippet', snippet,
+            'verbatim_quote', verbatim_quote,
+            'extracted_date', extracted_date,
+            'date_source', date_source,
+            'date_confidence', date_confidence,
+            'observed_at', observed_at,
+            'days_ago', days_ago,
+            'staleness_multiplier', staleness_multiplier,
+            'source_tier', source_tier,
+            'source_type', source_type,
+            'source_domain', source_domain,
+            'evidence_status', evidence_status,
+            'can_drive_high_confidence', can_drive_high_confidence,
+            'content_hash', content_hash,
+            'is_syndication', is_syndication,
             'evidence_type', evidence_type,
             'pain_category', pain_category,
-            'source_type', source_type,
-            'date', date
+            'pain_subtags', pain_subtags,
+            'pain_indicators', pain_indicators,
+            'confidence', confidence
         )
-        FROM extracted_evidence
+        FROM v3_evidence
         WHERE company_id = $1 AND run_id = $2
+        ORDER BY confidence DESC, source_tier ASC
         "#,
     )
     .bind(company_id)
     .bind(run_id)
     .fetch_all(pool)
+    .await?;
+    
+    // Load V3 analysis run summary
+    let analysis_run: Option<(JsonValue,)> = sqlx::query_as(
+        r#"
+        SELECT json_build_object(
+            'run_id', run_id,
+            'client_id', client_id,
+            'company_id', company_id,
+            'raw_score', raw_score,
+            'staleness_adjusted_score', staleness_adjusted_score,
+            'final_score', final_score,
+            'evidence_summary', evidence_summary,
+            'recency_summary', recency_summary,
+            'gates', gates,
+            'gates_passed', gates_passed,
+            'gates_failed', gates_failed,
+            'qualifies', qualifies,
+            'hypothesis_count', hypothesis_count,
+            'strong_fit_count', strong_fit_count,
+            'do_not_outreach', do_not_outreach,
+            'phase', phase,
+            'started_at', started_at,
+            'completed_at', completed_at,
+            'duration_ms', duration_ms,
+            'created_at', created_at
+        )
+        FROM v3_analysis_runs
+        WHERE company_id = $1 AND run_id = $2
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(company_id)
+    .bind(run_id)
+    .fetch_optional(pool)
     .await?;
     
     Ok((
         hypotheses.into_iter().map(|(j,)| j).collect(),
         evidence.into_iter().map(|(j,)| j).collect(),
+        analysis_run.map(|(j,)| j),
     ))
 }
 
-/// Load Apollo enrichment for aggregate request
-pub async fn load_apollo_enrichment(
+/// Load Phase 0 offer-fit result if available
+pub async fn load_phase0_result(
+    pool: &PgPool,
+    company_id: Uuid,
+    run_id: Uuid,
+) -> Result<Option<JsonValue>, sqlx::Error> {
+    let row: Option<(JsonValue,)> = sqlx::query_as(
+        r#"
+        SELECT json_build_object(
+            'fit', CASE WHEN icp_fit = 'qualify' THEN true ELSE false END,
+            'icp_fit', icp_fit,
+            'score', confidence,
+            'fit_strength', fit_strength,
+            'reasons', reasons,
+            'disqualify_reasons', disqualify_reasons,
+            'missing_info', missing_info,
+            'recommended_angles', recommended_angles,
+            'needs_review', needs_review,
+            'do_not_outreach', do_not_outreach,
+            'pipeline_continued', pipeline_continued
+        )
+        FROM offer_fit_decisions
+        WHERE company_id = $1 AND run_id = $2
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(company_id)
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    
+    Ok(row.map(|(j,)| j))
+}
+
+/// Load Apollo enrichment for aggregate request (V3 enhanced)
+pub async fn load_apollo_enrichment_v3(
     pool: &PgPool,
     company_id: Uuid,
 ) -> Result<JsonValue, sqlx::Error> {
-    let row: Option<(JsonValue, JsonValue, JsonValue, Option<String>, Option<i32>)> = sqlx::query_as(
+    let row: Option<(
+        Option<String>,      // apollo_org_id
+        Option<String>,      // description
+        Option<String>,      // industry
+        Option<i32>,         // estimated_num_employees
+        Vec<String>,         // technologies
+        Vec<String>,         // keywords
+        Option<i32>,         // founded_year
+        Option<i64>,         // annual_revenue
+        Option<String>,      // linkedin_url
+        Option<String>,      // city
+        Option<String>,      // state
+        Option<String>,      // country
+        JsonValue,           // funding_events
+        Option<i64>,         // total_funding_raised
+        Option<String>,      // latest_funding_stage
+        JsonValue,           // employee_metrics
+        JsonValue,           // employee_metrics_analysis
+        JsonValue,           // funding_analysis
+    )> = sqlx::query_as(
         r#"
         SELECT 
-            COALESCE(to_jsonb(technologies), '[]'::jsonb) as technologies,
-            COALESCE(employee_metrics_analysis, '{}'::jsonb) as emp_analysis,
-            COALESCE(funding_analysis, '{}'::jsonb) as fund_analysis,
+            apollo_org_id,
+            description,
             industry,
-            estimated_num_employees
+            estimated_num_employees,
+            COALESCE(technologies, '{}') as technologies,
+            COALESCE(keywords, '{}') as keywords,
+            founded_year,
+            annual_revenue,
+            linkedin_url,
+            city,
+            state,
+            country,
+            COALESCE(funding_events, '[]'::jsonb) as funding_events,
+            total_funding_raised,
+            latest_funding_stage,
+            COALESCE(employee_metrics, '[]'::jsonb) as employee_metrics,
+            COALESCE(employee_metrics_analysis, '{}'::jsonb) as emp_analysis,
+            COALESCE(funding_analysis, '{}'::jsonb) as fund_analysis
         FROM company_apollo_enrichment
         WHERE company_id = $1
         "#,
@@ -434,23 +614,79 @@ pub async fn load_apollo_enrichment(
     .await?;
     
     match row {
-        Some((tech, emp, fund, industry, emp_count)) => Ok(json!({
-            "technologies": tech,
-            "employee_metrics_analysis": emp,
-            "funding_analysis": fund,
+        Some((
+            apollo_org_id,
+            description,
+            industry,
+            emp_count,
+            technologies,
+            keywords,
+            founded_year,
+            annual_revenue,
+            linkedin_url,
+            city,
+            state,
+            country,
+            funding_events,
+            total_funding,
+            latest_stage,
+            employee_metrics,
+            emp_analysis,
+            fund_analysis,
+        )) => Ok(json!({
+            "apollo_org_id": apollo_org_id,
+            "description": description,
             "industry": industry,
-            "estimated_num_employees": emp_count,
+            "employee_count": emp_count,
+            "technologies": technologies,
+            "keywords": keywords,
+            "founded_year": founded_year,
+            "annual_revenue": annual_revenue,
+            "linkedin_url": linkedin_url,
+            "city": city,
+            "state": state,
+            "country": country,
+            "funding_events": funding_events,
+            "total_funding_raised": total_funding,
+            "latest_funding_stage": latest_stage,
+            "employee_metrics": employee_metrics,
+            "employee_metrics_analysis": emp_analysis,
+            "funding_analysis": fund_analysis,
         })),
         None => Ok(json!({})),
     }
 }
 
-/// Load client context from clients table
-pub async fn load_client_context(
+/// Load client context from client_icp_profiles table (preferred) or clients table
+pub async fn load_client_context_v3(
     pool: &PgPool,
     client_id: Uuid,
 ) -> Result<JsonValue, sqlx::Error> {
-    let row: Option<(Option<JsonValue>,)> = sqlx::query_as(
+    // Try client_icp_profiles first (V3 preferred source)
+    let icp_row: Option<(JsonValue, JsonValue)> = sqlx::query_as(
+        r#"
+        SELECT 
+            COALESCE(icp_json, '{}'::jsonb) as icp,
+            COALESCE(tech_preferences, '{}'::jsonb) as tech_prefs
+        FROM client_icp_profiles
+        WHERE client_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(client_id)
+    .fetch_optional(pool)
+    .await?;
+    
+    if let Some((icp, tech_prefs)) = icp_row {
+        return Ok(json!({
+            "icp": icp,
+            "tech_preferences": tech_prefs,
+        }));
+    }
+    
+    // Fallback to clients.config
+    let client_row: Option<(Option<JsonValue>,)> = sqlx::query_as(
         r#"
         SELECT config
         FROM clients
@@ -461,7 +697,7 @@ pub async fn load_client_context(
     .fetch_optional(pool)
     .await?;
     
-    Ok(row.and_then(|(c,)| c).unwrap_or(json!({})))
+    Ok(client_row.and_then(|(c,)| c).unwrap_or(json!({})))
 }
 
 /// Get company info
@@ -488,6 +724,157 @@ pub async fn get_company_info(
     .await
 }
 
+/// Store aggregate result in aggregate_results table
+pub async fn store_aggregate_result(
+    pool: &PgPool,
+    run_id: Uuid,
+    company_id: Uuid,
+    client_id: Uuid,
+    result: &JsonValue,
+) -> Result<(), sqlx::Error> {
+    let final_score = result.get("final_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let tier = result.get("tier").and_then(|v| v.as_str()).unwrap_or("D");
+    let qualifies = result.get("qualifies").and_then(|v| v.as_bool()).unwrap_or(false);
+    let do_not_outreach = result.get("do_not_outreach").and_then(|v| v.as_bool()).unwrap_or(false);
+    let needs_review = result.get("needs_review").and_then(|v| v.as_bool()).unwrap_or(false);
+    
+    let score_breakdown = result.get("score_breakdown").cloned().unwrap_or(json!({}));
+    let unified_hypotheses = result.get("unified_hypotheses").cloned().unwrap_or(json!([]));
+    let tech_context = result.get("tech_context").cloned().unwrap_or(json!({}));
+    let final_offer_fit = result.get("final_offer_fit").cloned().unwrap_or(json!({}));
+    let contact_suggestions = result.get("contact_suggestions").cloned().unwrap_or(json!({}));
+    
+    // Extract arrays
+    let decision_notes: Vec<String> = result
+        .get("decision_notes")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    
+    let recommended_personas: Vec<String> = contact_suggestions
+        .get("personas")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    
+    let title_keywords: Vec<String> = contact_suggestions
+        .get("title_keywords")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    
+    let title_exact: Vec<String> = contact_suggestions
+        .get("title_exact")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    
+    // Extract metadata
+    let meta = result.get("_meta").cloned().unwrap_or(json!({}));
+    let llm_calls = meta.get("llm_calls").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let duration_ms = meta.get("duration_ms").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    
+    sqlx::query(
+        r#"
+        INSERT INTO aggregate_results (
+            run_id,
+            company_id,
+            client_id,
+            final_score,
+            tier,
+            qualifies,
+            do_not_outreach,
+            needs_review,
+            score_breakdown,
+            output_json,
+            unified_hypotheses,
+            tech_fit,
+            offer_fit,
+            recommended_personas,
+            title_keywords,
+            title_exact,
+            decision_notes,
+            llm_calls,
+            duration_ms,
+            created_at,
+            updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, NOW(), NOW())
+        ON CONFLICT (run_id) DO UPDATE SET
+            final_score = EXCLUDED.final_score,
+            tier = EXCLUDED.tier,
+            qualifies = EXCLUDED.qualifies,
+            do_not_outreach = EXCLUDED.do_not_outreach,
+            needs_review = EXCLUDED.needs_review,
+            score_breakdown = EXCLUDED.score_breakdown,
+            output_json = EXCLUDED.output_json,
+            unified_hypotheses = EXCLUDED.unified_hypotheses,
+            tech_fit = EXCLUDED.tech_fit,
+            offer_fit = EXCLUDED.offer_fit,
+            recommended_personas = EXCLUDED.recommended_personas,
+            title_keywords = EXCLUDED.title_keywords,
+            title_exact = EXCLUDED.title_exact,
+            decision_notes = EXCLUDED.decision_notes,
+            llm_calls = EXCLUDED.llm_calls,
+            duration_ms = EXCLUDED.duration_ms,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(run_id)
+    .bind(company_id)
+    .bind(client_id)
+    .bind(final_score)
+    .bind(tier)
+    .bind(qualifies)
+    .bind(do_not_outreach)
+    .bind(needs_review)
+    .bind(&score_breakdown)
+    .bind(result)  // Full output_json
+    .bind(&unified_hypotheses)
+    .bind(&tech_context)
+    .bind(&final_offer_fit)
+    .bind(&recommended_personas)
+    .bind(&title_keywords)
+    .bind(&title_exact)
+    .bind(&decision_notes)
+    .bind(llm_calls)
+    .bind(duration_ms)
+    .execute(pool)
+    .await?;
+    
+    info!(
+        "Stored aggregate result: run_id={} score={:.2} tier={} qualifies={}",
+        run_id, final_score, tier, qualifies
+    );
+    
+    Ok(())
+}
+
+/// Update v3_analysis_runs with aggregate status
+pub async fn update_analysis_run_aggregate_status(
+    pool: &PgPool,
+    run_id: Uuid,
+    status: &str,
+    score: Option<f64>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE v3_analysis_runs SET
+            aggregate_completed_at = NOW(),
+            aggregate_status = $2,
+            aggregate_score = $3
+        WHERE run_id = $1
+        "#,
+    )
+    .bind(run_id)
+    .bind(status)
+    .bind(score)
+    .execute(pool)
+    .await?;
+    
+    Ok(())
+}
+
 // ----------------------------
 // Azure Function Trigger
 // ----------------------------
@@ -506,13 +893,15 @@ pub async fn trigger_aggregate(
     let mut req_builder = http_client
         .post(&url)
         .header("Content-Type", "application/json")
-        .timeout(std::time::Duration::from_secs(120))  // 2 min timeout for aggregate
+        .timeout(std::time::Duration::from_secs(180))  // 3 min timeout for aggregate (5 LLM calls)
         .json(request);
     
     // Add function key if configured
     if !AZURE_FUNCTION_KEY.is_empty() {
         req_builder = req_builder.header("x-functions-key", AZURE_FUNCTION_KEY.as_str());
     }
+    
+    info!("Calling Azure Function aggregate: {}", url);
     
     let response = req_builder
         .send()
@@ -537,7 +926,7 @@ pub async fn trigger_aggregate(
 // Main Job Handler
 // ----------------------------
 
-/// Handle PHASE_B_ENRICH_APOLLO job
+/// Handle PHASE_B_ENRICH_APOLLO job (V3 version)
 pub async fn handle_phase_b_enrich(
     pool: &PgPool,
     http_client: &Client,
@@ -574,6 +963,13 @@ pub async fn handle_phase_b_enrich(
                         }
                         None => {
                             warn!("Worker {}: no Apollo org found for domain {}", worker_id, payload.domain);
+                            // Update status to skipped
+                            let _ = update_analysis_run_aggregate_status(
+                                pool, 
+                                payload.prequal_run_id, 
+                                "skipped_no_apollo", 
+                                None
+                            ).await;
                             return Ok(json!({
                                 "status": "skipped",
                                 "reason": "no_apollo_org_found",
@@ -592,6 +988,12 @@ pub async fn handle_phase_b_enrich(
         Ok(org) => org,
         Err(e) => {
             error!("Worker {}: Apollo API failed: {}", worker_id, e);
+            let _ = update_analysis_run_aggregate_status(
+                pool, 
+                payload.prequal_run_id, 
+                "failed_apollo_api", 
+                None
+            ).await;
             return Err(e.into());
         }
     };
@@ -615,18 +1017,33 @@ pub async fn handle_phase_b_enrich(
     };
     let fund_analysis = handle_analyze_funding_events(pool, &fund_payload, worker_id).await?;
     
-    // Step 6: Load prequal data
-    info!("Worker {}: loading prequal data", worker_id);
-    let (prequal_hypotheses, prequal_evidence) = 
-        load_prequal_data(pool, payload.company_id, payload.prequal_run_id).await?;
+    // Step 6: Load V3 prequal data
+    info!("Worker {}: loading V3 prequal data", worker_id);
+    let (prequal_hypotheses, prequal_evidence, analysis_run) = 
+        load_prequal_data_v3(pool, payload.company_id, payload.prequal_run_id).await?;
     
-    // Step 7: Load enrichment for request
-    let apollo_enrichment = load_apollo_enrichment(pool, payload.company_id).await?;
+    info!(
+        "Worker {}: loaded {} hypotheses, {} evidence items",
+        worker_id, prequal_hypotheses.len(), prequal_evidence.len()
+    );
     
-    // Step 8: Load client context
-    let client_context = load_client_context(pool, payload.client_id).await?;
+    // Build prequal_output structure for aggregator
+    let prequal_output = json!({
+        "analysis_run": analysis_run,
+        "hypotheses": prequal_hypotheses,
+        "evidence": prequal_evidence,
+    });
     
-    // Step 9: Trigger Azure Function aggregate
+    // Step 7: Load Apollo enrichment (full V3 version)
+    let apollo_enrichment = load_apollo_enrichment_v3(pool, payload.company_id).await?;
+    
+    // Step 8: Load client context (with ICP profile)
+    let client_context = load_client_context_v3(pool, payload.client_id).await?;
+    
+    // Step 9: Load Phase 0 result if available
+    let phase0_icp = load_phase0_result(pool, payload.company_id, payload.prequal_run_id).await?;
+    
+    // Step 10: Build aggregate request
     info!("Worker {}: triggering Azure Function aggregate", worker_id);
     let aggregate_request = AggregateRequest {
         client_id: payload.client_id,
@@ -635,21 +1052,69 @@ pub async fn handle_phase_b_enrich(
         domain: payload.domain.clone(),
         mode: "aggregate".to_string(),
         run_id: payload.prequal_run_id,
-        prequal_hypotheses,
-        prequal_evidence,
+        prequal_output,
         apollo_enrichment,
         employee_metrics_analysis: serde_json::to_value(&emp_analysis)?,
         funding_analysis: serde_json::to_value(&fund_analysis)?,
         client_context,
+        phase0_icp,
     };
     
-    let aggregate_result = trigger_aggregate(http_client, &aggregate_request).await?;
+    // Step 11: Call Azure Function
+    let aggregate_result = match trigger_aggregate(http_client, &aggregate_request).await {
+        Ok(result) => result,
+        Err(e) => {
+            error!("Worker {}: Azure Function aggregate failed: {}", worker_id, e);
+            let _ = update_analysis_run_aggregate_status(
+                pool, 
+                payload.prequal_run_id, 
+                "failed_aggregate", 
+                None
+            ).await;
+            return Err(e.into());
+        }
+    };
+    
+    // Step 12: Store aggregate result
+    let final_score = aggregate_result.get("final_score").and_then(|v| v.as_f64());
+    let tier = aggregate_result.get("tier").and_then(|v| v.as_str()).unwrap_or("D");
+    let qualifies = aggregate_result.get("qualifies").and_then(|v| v.as_bool()).unwrap_or(false);
+    let unified_count = aggregate_result
+        .get("unified_hypotheses")
+        .and_then(|h| h.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    
+    // Store in aggregate_results table
+    if let Err(e) = store_aggregate_result(
+        pool,
+        payload.prequal_run_id,
+        payload.company_id,
+        payload.client_id,
+        &aggregate_result,
+    ).await {
+        error!("Worker {}: failed to store aggregate result: {:?}", worker_id, e);
+        // Don't fail the job, just log
+    }
+    
+    // Update v3_analysis_runs with aggregate status
+    if let Err(e) = update_analysis_run_aggregate_status(
+        pool,
+        payload.prequal_run_id,
+        "success",
+        final_score,
+    ).await {
+        error!("Worker {}: failed to update analysis run status: {:?}", worker_id, e);
+    }
     
     info!(
-        "Worker {}: Phase B complete for company {} (aggregate hypotheses={})",
+        "Worker {}: Phase B complete for company {} (score={:.2}, tier={}, qualifies={}, unified_hypotheses={})",
         worker_id,
         payload.company_id,
-        aggregate_result.get("pain_hypotheses").and_then(|h| h.as_array()).map(|a| a.len()).unwrap_or(0)
+        final_score.unwrap_or(0.0),
+        tier,
+        qualifies,
+        unified_count
     );
     
     Ok(aggregate_result)
