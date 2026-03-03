@@ -18,6 +18,7 @@ use uuid::Uuid;
 pub enum JobType {
     // Existing job types
     DiscoverProspects,
+    DiscoverCompanies,
     EnrichLeads,
     AiPersonalize,
     SendEmails,
@@ -40,6 +41,7 @@ impl JobType {
         match self {
             // Existing
             JobType::DiscoverProspects => "discover_prospects",
+            JobType::DiscoverCompanies => "discover_companies",
             JobType::EnrichLeads => "enrich_leads",
             JobType::AiPersonalize => "ai_personalize",
             JobType::SendEmails => "send_emails",
@@ -69,6 +71,7 @@ impl FromStr for JobType {
         match s {
             // snake_case (preferred)
             "discover_prospects" => Ok(JobType::DiscoverProspects),
+            "discover_companies" => Ok(JobType::DiscoverCompanies),
             "enrich_leads" => Ok(JobType::EnrichLeads),
             "ai_personalize" => Ok(JobType::AiPersonalize),
             "send_emails" => Ok(JobType::SendEmails),
@@ -86,6 +89,7 @@ impl FromStr for JobType {
 
             // optional: legacy UPPER_CASE support
             "DISCOVER_PROSPECTS" => Ok(JobType::DiscoverProspects),
+            "DISCOVER_COMPANIES" => Ok(JobType::DiscoverCompanies),
             "ENRICH_LEADS" => Ok(JobType::EnrichLeads),
             "AI_PERSONALIZE" => Ok(JobType::AiPersonalize),
             "SEND_EMAILS" => Ok(JobType::SendEmails),
