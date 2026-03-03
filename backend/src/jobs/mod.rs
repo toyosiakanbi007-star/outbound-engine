@@ -3,11 +3,17 @@
 pub mod models;
 pub mod service;
 
+// Company fetcher (discovery + enrichment pipeline)
+pub mod company_fetcher;
+
 // V3: Phase B modules
 pub mod employee_metrics;
 pub mod funding_analysis;
 pub mod phase_b_controller;
 pub mod prequal_listener;
+
+// V3: Prequal Worker (batch dispatch + execution)
+pub mod prequal_worker;
 
 // Re-export commonly used items for convenience
 pub use models::{Job, JobStatus, JobType};
@@ -33,3 +39,11 @@ pub use phase_b_controller::{
 };
 
 pub use prequal_listener::run_prequal_listener;
+
+// V3: Re-export Prequal Worker handlers and payloads
+pub use prequal_worker::{
+    handle_prequal_dispatch,
+    handle_prequal_batch,
+    PrequalDispatchPayload,
+    PrequalBatchPayload,
+};

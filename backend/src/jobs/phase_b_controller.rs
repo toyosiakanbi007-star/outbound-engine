@@ -565,26 +565,31 @@ pub async fn load_apollo_enrichment_v3(
     pool: &PgPool,
     company_id: Uuid,
 ) -> Result<JsonValue, sqlx::Error> {
-    let row: Option<(
-        Option<String>,      // apollo_org_id
-        Option<String>,      // description
-        Option<String>,      // industry
-        Option<i32>,         // estimated_num_employees
-        Vec<String>,         // technologies
-        Vec<String>,         // keywords
-        Option<i32>,         // founded_year
-        Option<i64>,         // annual_revenue
-        Option<String>,      // linkedin_url
-        Option<String>,      // city
-        Option<String>,      // state
-        Option<String>,      // country
-        JsonValue,           // funding_events
-        Option<i64>,         // total_funding_raised
-        Option<String>,      // latest_funding_stage
-        JsonValue,           // employee_metrics
-        JsonValue,           // employee_metrics_analysis
-        JsonValue,           // funding_analysis
-    )> = sqlx::query_as(
+    // sqlx FromRow only supports tuples up to 16 fields.
+    // Use a named struct for the 18-column SELECT.
+    #[derive(sqlx::FromRow)]
+    struct EnrichmentRow {
+        apollo_org_id: Option<String>,
+        description: Option<String>,
+        industry: Option<String>,
+        estimated_num_employees: Option<i32>,
+        technologies: Vec<String>,
+        keywords: Vec<String>,
+        founded_year: Option<i32>,
+        annual_revenue: Option<i64>,
+        linkedin_url: Option<String>,
+        city: Option<String>,
+        state: Option<String>,
+        country: Option<String>,
+        funding_events: JsonValue,
+        total_funding_raised: Option<i64>,
+        latest_funding_stage: Option<String>,
+        employee_metrics: JsonValue,
+        emp_analysis: JsonValue,
+        fund_analysis: JsonValue,
+    }
+
+    let row: Option<EnrichmentRow> = sqlx::query_as(
         r#"
         SELECT 
             apollo_org_id,
@@ -614,44 +619,25 @@ pub async fn load_apollo_enrichment_v3(
     .await?;
     
     match row {
-        Some((
-            apollo_org_id,
-            description,
-            industry,
-            emp_count,
-            technologies,
-            keywords,
-            founded_year,
-            annual_revenue,
-            linkedin_url,
-            city,
-            state,
-            country,
-            funding_events,
-            total_funding,
-            latest_stage,
-            employee_metrics,
-            emp_analysis,
-            fund_analysis,
-        )) => Ok(json!({
-            "apollo_org_id": apollo_org_id,
-            "description": description,
-            "industry": industry,
-            "employee_count": emp_count,
-            "technologies": technologies,
-            "keywords": keywords,
-            "founded_year": founded_year,
-            "annual_revenue": annual_revenue,
-            "linkedin_url": linkedin_url,
-            "city": city,
-            "state": state,
-            "country": country,
-            "funding_events": funding_events,
-            "total_funding_raised": total_funding,
-            "latest_funding_stage": latest_stage,
-            "employee_metrics": employee_metrics,
-            "employee_metrics_analysis": emp_analysis,
-            "funding_analysis": fund_analysis,
+        Some(r) => Ok(json!({
+            "apollo_org_id": r.apollo_org_id,
+            "description": r.description,
+            "industry": r.industry,
+            "employee_count": r.estimated_num_employees,
+            "technologies": r.technologies,
+            "keywords": r.keywords,
+            "founded_year": r.founded_year,
+            "annual_revenue": r.annual_revenue,
+            "linkedin_url": r.linkedin_url,
+            "city": r.city,
+            "state": r.state,
+            "country": r.country,
+            "funding_events": r.funding_events,
+            "total_funding_raised": r.total_funding_raised,
+            "latest_funding_stage": r.latest_funding_stage,
+            "employee_metrics": r.employee_metrics,
+            "employee_metrics_analysis": r.emp_analysis,
+            "funding_analysis": r.fund_analysis,
         })),
         None => Ok(json!({})),
     }

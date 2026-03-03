@@ -33,7 +33,13 @@ pub struct Config {
     pub ses_secret_key: Option<String>,
 
     pub apollo_api_key: Option<String>,
+    pub apollo_base_url: Option<String>,
     pub prospeo_api_key: Option<String>,
+
+    /// Which org search provider to use: "apollo" (default) or "diffbot".
+    pub org_provider: String,
+    pub diffbot_token: Option<String>,
+    pub diffbot_base_url: Option<String>,
 
     /// Optional HTTP news service endpoint.
     ///
@@ -94,7 +100,12 @@ impl Config {
         let ses_secret_key = env::var("SES_SECRET_ACCESS_KEY").ok();
 
         let apollo_api_key = env::var("APOLLO_API_KEY").ok();
+        let apollo_base_url = env::var("APOLLO_BASE_URL").ok();
         let prospeo_api_key = env::var("PROSPEO_API_KEY").ok();
+
+        let org_provider = env::var("ORG_PROVIDER").unwrap_or_else(|_| "apollo".to_string());
+        let diffbot_token = env::var("DIFFBOT_TOKEN").ok();
+        let diffbot_base_url = env::var("DIFFBOT_BASE_URL").ok();
 
         // Generic “HTTP news service” config (used by AzureHttpNewsSourcingClient as fallback
         // if NEWS_AZURE_FUNCTION_URL is not set).
@@ -112,7 +123,11 @@ impl Config {
             ses_access_key,
             ses_secret_key,
             apollo_api_key,
+            apollo_base_url,
             prospeo_api_key,
+            org_provider,
+            diffbot_token,
+            diffbot_base_url,
             news_service_base_url,
             news_service_api_key,
             llm_provider,

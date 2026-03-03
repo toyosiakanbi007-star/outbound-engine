@@ -28,6 +28,10 @@ pub enum JobType {
     PhaseBEnrichApollo,
     AnalyzeEmployeeMetrics,
     AnalyzeFundingEvents,
+
+    // V3: Prequal Worker job types
+    PrequalDispatch,
+    PrequalBatch,
 }
 
 impl JobType {
@@ -46,6 +50,10 @@ impl JobType {
             JobType::PhaseBEnrichApollo => "phase_b_enrich_apollo",
             JobType::AnalyzeEmployeeMetrics => "analyze_employee_metrics",
             JobType::AnalyzeFundingEvents => "analyze_funding_events",
+
+            // V3: Prequal Worker
+            JobType::PrequalDispatch => "prequal_dispatch",
+            JobType::PrequalBatch => "prequal_batch",
         }
     }
 }
@@ -72,6 +80,10 @@ impl FromStr for JobType {
             "analyze_employee_metrics" => Ok(JobType::AnalyzeEmployeeMetrics),
             "analyze_funding_events" => Ok(JobType::AnalyzeFundingEvents),
 
+            // V3: Prequal Worker (snake_case)
+            "prequal_dispatch" => Ok(JobType::PrequalDispatch),
+            "prequal_batch" => Ok(JobType::PrequalBatch),
+
             // optional: legacy UPPER_CASE support
             "DISCOVER_PROSPECTS" => Ok(JobType::DiscoverProspects),
             "ENRICH_LEADS" => Ok(JobType::EnrichLeads),
@@ -84,6 +96,10 @@ impl FromStr for JobType {
             "PHASE_B_ENRICH_APOLLO" => Ok(JobType::PhaseBEnrichApollo),
             "ANALYZE_EMPLOYEE_METRICS" => Ok(JobType::AnalyzeEmployeeMetrics),
             "ANALYZE_FUNDING_EVENTS" => Ok(JobType::AnalyzeFundingEvents),
+
+            // V3: Prequal Worker (UPPER_CASE)
+            "PREQUAL_DISPATCH" => Ok(JobType::PrequalDispatch),
+            "PREQUAL_BATCH" => Ok(JobType::PrequalBatch),
 
             other => Err(format!("Unknown job_type: {}", other)),
         }

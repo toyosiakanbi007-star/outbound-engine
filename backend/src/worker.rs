@@ -12,6 +12,18 @@ use crate::jobs::{
     handle_phase_b_enrich, PhaseBPayload,
 };
 
+// V3: Import Prequal Worker handlers
+use crate::jobs::{
+    handle_prequal_dispatch, PrequalDispatchPayload,
+    handle_prequal_batch, PrequalBatchPayload,
+};
+
+// V4: Import Company Fetcher + Provider abstraction
+use crate::jobs::company_fetcher::{
+    ApolloClient, DiffbotClient, OrgSearchProvider, OrgProviderKind,
+    DiscoverCompaniesPayload, run_company_fetcher,
+};
+
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use sqlx::{self, Error};
@@ -33,6 +45,50 @@ pub async fn run_worker(pool: DbPool, news_client: DynNewsSourcingClient) -> any
             .expect("Failed to create HTTP client")
     );
 
+    // V4: Create org search provider for Company Fetcher (Apollo or Diffbot)
+    let org_provider_kind = OrgProviderKind::from_str(
+        &std::env::var("ORG_PROVIDER").unwrap_or_else(|_| "apollo".to_string()),
+    );
+
+    let org_provider: Arc<dyn OrgSearchProvider> = match org_provider_kind {
+        OrgProviderKind::Diffbot => {
+            let token = std::env::var("DIFFBOT_TOKEN").unwrap_or_default();
+            let base_url = std::env::var("DIFFBOT_BASE_URL").ok();
+            let client = DiffbotClient::new(
+                HttpClient::builder()
+                    .timeout(Duration::from_secs(60))
+                    .build()
+                    .expect("Failed to create Diffbot HTTP client"),
+                token,
+                base_url,
+            );
+            if let Err(e) = client.validate() {
+                warn!("Diffbot client not configured: {} — DiscoverCompanies jobs will fail", e);
+            } else {
+                info!("Org search provider: diffbot");
+            }
+            Arc::new(client)
+        }
+        OrgProviderKind::Apollo => {
+            let api_key = std::env::var("APOLLO_API_KEY").unwrap_or_default();
+            let base_url = std::env::var("APOLLO_BASE_URL").ok();
+            let client = ApolloClient::new(
+                HttpClient::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .expect("Failed to create Apollo HTTP client"),
+                api_key,
+                base_url,
+            );
+            if let Err(e) = client.validate() {
+                warn!("Apollo client not configured: {} — DiscoverCompanies jobs will fail", e);
+            } else {
+                info!("Org search provider: apollo");
+            }
+            Arc::new(client)
+        }
+    };
+
     tracing::info!(
         target: "backend::worker",
         "Worker starting with id={} (MODE=worker)",
@@ -43,7 +99,7 @@ pub async fn run_worker(pool: DbPool, news_client: DynNewsSourcingClient) -> any
     loop {
         match fetch_next_job(&pool, &worker_id).await {
             Ok(Some(job)) => {
-                if let Err(err) = process_job(&pool, &job, &worker_id, &news_client, &http_client).await {
+                if let Err(err) = process_job(&pool, &job, &worker_id, &news_client, &http_client, &org_provider).await {
                     error!("Error while processing job {}: {:?}", job.id, err);
 
                     if let Err(e) =
@@ -118,6 +174,7 @@ pub async fn process_job(
     worker_id: &str,
     news_client: &DynNewsSourcingClient,
     http_client: &Arc<HttpClient>,  // V3: Added HTTP client
+    org_provider: &Arc<dyn OrgSearchProvider>,  // V4: Org search provider (Apollo or Diffbot)
 ) -> Result<(), Error> {
     // Parse DB job_type string -> JobType enum
     let job_type = match job.job_type_enum() {
@@ -294,6 +351,139 @@ pub async fn process_job(
                     error!(
                         "Worker {}: Funding analysis failed for company {}: {:?}",
                         worker_id, payload.company_id, e
+                    );
+                    mark_job_failed(pool, job.id, worker_id, &format!("{:?}", e)).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // =====================================================
+        // V3: Prequal Worker Job Handlers
+        // =====================================================
+
+        JobType::PrequalDispatch => {
+            info!(
+                "Worker {} handling job {} of type PREQUAL_DISPATCH",
+                worker_id, job.id
+            );
+
+            let payload: PrequalDispatchPayload = match serde_json::from_value(job.payload.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        "Worker {}: invalid PREQUAL_DISPATCH payload for job {}: {}",
+                        worker_id, job.id, e
+                    );
+                    mark_job_failed(pool, job.id, worker_id, &format!("invalid payload: {}", e)).await?;
+                    return Ok(());
+                }
+            };
+
+            match handle_prequal_dispatch(pool, &payload, worker_id).await {
+                Ok(result) => {
+                    info!(
+                        "Worker {}: PREQUAL_DISPATCH complete — selected={}, batches={}",
+                        worker_id, result.candidates_selected, result.batches_created
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Worker {}: PREQUAL_DISPATCH failed for client {}: {:?}",
+                        worker_id, payload.client_id, e
+                    );
+                    mark_job_failed(pool, job.id, worker_id, &format!("{:?}", e)).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        JobType::PrequalBatch => {
+            info!(
+                "Worker {} handling job {} of type PREQUAL_BATCH",
+                worker_id, job.id
+            );
+
+            let payload: PrequalBatchPayload = match serde_json::from_value(job.payload.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        "Worker {}: invalid PREQUAL_BATCH payload for job {}: {}",
+                        worker_id, job.id, e
+                    );
+                    mark_job_failed(pool, job.id, worker_id, &format!("invalid payload: {}", e)).await?;
+                    return Ok(());
+                }
+            };
+
+            match handle_prequal_batch(pool, http_client.as_ref(), &payload, worker_id).await {
+                Ok(outcome) => {
+                    info!(
+                        "Worker {}: PREQUAL_BATCH {} complete — succeeded={}, failed={}, qualified={}",
+                        worker_id, payload.batch_id,
+                        outcome.succeeded, outcome.failed, outcome.qualified
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Worker {}: PREQUAL_BATCH {} failed: {:?}",
+                        worker_id, payload.batch_id, e
+                    );
+                    mark_job_failed(pool, job.id, worker_id, &format!("{:?}", e)).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // =====================================================
+        // V4: Company Fetcher
+        // =====================================================
+
+        JobType::DiscoverCompanies => {
+            info!(
+                "Worker {} handling job {} of type DISCOVER_COMPANIES",
+                worker_id, job.id
+            );
+
+            let payload: DiscoverCompaniesPayload = match serde_json::from_value(job.payload.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        "Worker {}: invalid DISCOVER_COMPANIES payload for job {}: {}",
+                        worker_id, job.id, e
+                    );
+                    mark_job_failed(pool, job.id, worker_id, &format!("invalid payload: {}", e)).await?;
+                    return Ok(());
+                }
+            };
+
+            // Validate org search provider is configured before starting a long-running fetch
+            if let Err(e) = org_provider.validate() {
+                error!(
+                    "Worker {}: Org provider not configured for DISCOVER_COMPANIES job {}: {}",
+                    worker_id, job.id, e
+                );
+                mark_job_failed(pool, job.id, worker_id, &format!("provider not configured: {}", e)).await?;
+                return Ok(());
+            }
+
+            match run_company_fetcher(pool, org_provider.as_ref(), &payload, worker_id).await {
+                Ok(result) => {
+                    info!(
+                        "Worker {}: Company fetch run {} complete: status={}, upserted={}, pages={}, prequal_jobs={}, elapsed={}s",
+                        worker_id,
+                        result.run_id,
+                        result.status,
+                        result.unique_upserted,
+                        result.pages_fetched,
+                        result.prequal_jobs_created,
+                        result.elapsed_seconds,
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Worker {}: Company fetch failed for client {}: {:?}",
+                        worker_id, payload.client_id, e
                     );
                     mark_job_failed(pool, job.id, worker_id, &format!("{:?}", e)).await?;
                     return Ok(());
