@@ -81,6 +81,18 @@ pub struct DiscoverCompaniesPayload {
 
     /// Optional: override the fetch run ID (for retries/resume).
     pub resume_run_id: Option<Uuid>,
+
+    /// If true, ignore all persisted fetch cursors and re-scan from page 1.
+    ///
+    /// Use this when:
+    ///   - The ICP has changed significantly (new keywords, categories, sizes)
+    ///   - You suspect the provider's dataset has shifted substantially
+    ///   - You want to catch companies that appeared in earlier positions
+    ///     since the last run (e.g. new Diffbot crawl data)
+    ///
+    /// Default: false (resume from persisted cursors — zero wasted credits).
+    #[serde(default)]
+    pub force_full_rescan: bool,
 }
 
 fn default_batch_target() -> i32 { 2000 }
@@ -1252,5 +1264,18 @@ mod tests {
         assert!((payload.exploration_pct - 0.20).abs() < f64::EPSILON);
         assert!(payload.enqueue_prequal_jobs);
         assert!(payload.resume_run_id.is_none());
+        assert!(!payload.force_full_rescan);
+    }
+
+    #[test]
+    fn test_deserialize_payload_force_rescan() {
+        let json = r#"{
+            "client_id": "550e8400-e29b-41d4-a716-446655440000",
+            "force_full_rescan": true,
+            "batch_target": 500
+        }"#;
+        let payload: DiscoverCompaniesPayload = serde_json::from_str(json).unwrap();
+        assert!(payload.force_full_rescan);
+        assert_eq!(payload.batch_target, 500);
     }
 }

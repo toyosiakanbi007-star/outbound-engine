@@ -19,7 +19,8 @@
 //
 // DQL QUERY BUILDING:
 //   Apollo request fields map to Diffbot DQL clauses:
-//     organization_locations[]      → location.country.name:"United States"
+//     organization_locations[]      → or(location.country.name:"us", ...)
+//     organization_not_locations[]  → not(or(location.country.name:"cn", ...))
 //     organization_industry_tag_ids → categories.name:"Software Companies"
 //     organization_num_employees_ranges → nbEmployees>=51 nbEmployees<=200
 //     page/per_page                → from=(page-1)*per_page, size=per_page
@@ -94,11 +95,12 @@ impl DiffbotClient {
     /// DQL template:
     ///   type:Organization
     ///   categories.name:"{diffbot_category}"
-    ///   location.country.name:"{country_lower}"
+    ///   or(location.country.name:"{country1}", location.country.name:"{country2}")
+    ///   not(or(location.country.name:"{excl1}", ...))
     ///   nbEmployees>{min} nbEmployees<{max}
     ///   {include_all: description:"must1" description:"must2"}
-    ///   ( {include_any: description:"kw1" OR description:"kw2" OR name:"kw1" OR name:"kw2"} )
-    ///   NOT ( {exclude: description:"bad1" OR description:"bad2" OR name:"bad1" OR name:"bad2"} )
+    ///   ( {include_any: or(description:"kw1", name:"kw1", description:"kw2", ...)} )
+    ///   NOT ( {exclude: not(or(description:"bad1", name:"bad1", ...)) )
     ///   not(isDissolved:true)
     fn build_dql_query(request: &ApolloOrgSearchRequest) -> String {
         let mut clauses: Vec<String> = vec!["type:Organization".to_string()];
@@ -110,13 +112,54 @@ impl DiffbotClient {
             }
         }
 
-        // Location filter: lowercase for Diffbot UI compatibility
+        // ---- FIX #1: Location filter — use or() for multiple locations ----
+        // Previously each location was a separate AND clause, meaning
+        // "United States" AND "Germany" → 0 results (company can't be in both).
+        // Now we wrap multiple locations in or() for correct OR semantics.
         if let Some(ref locations) = request.organization_locations {
-            for loc in locations {
+            if locations.len() == 1 {
+                // Single location: simple clause (no or() wrapper needed)
                 clauses.push(format!(
                     "location.country.name:\"{}\"",
-                    escape_dql(&loc.to_lowercase())
+                    escape_dql(&locations[0].to_lowercase())
                 ));
+            } else if locations.len() > 1 {
+                // Multiple locations: wrap in or() for correct OR semantics
+                let loc_parts: Vec<String> = locations
+                    .iter()
+                    .map(|loc| {
+                        format!(
+                            "location.country.name:\"{}\"",
+                            escape_dql(&loc.to_lowercase())
+                        )
+                    })
+                    .collect();
+                clauses.push(format!("or({})", loc_parts.join(", ")));
+            }
+        }
+
+        // ---- FIX #2: Excluded locations — was completely missing ----
+        // organization_not_locations was populated by the VariantBuilder but
+        // never consumed by the DQL builder. Now we emit not(or(...)) for them.
+        if let Some(ref not_locations) = request.organization_not_locations {
+            if !not_locations.is_empty() {
+                if not_locations.len() == 1 {
+                    clauses.push(format!(
+                        "not(location.country.name:\"{}\")",
+                        escape_dql(&not_locations[0].to_lowercase())
+                    ));
+                } else {
+                    let not_parts: Vec<String> = not_locations
+                        .iter()
+                        .map(|loc| {
+                            format!(
+                                "location.country.name:\"{}\"",
+                                escape_dql(&loc.to_lowercase())
+                            )
+                        })
+                        .collect();
+                    clauses.push(format!("not(or({}))", not_parts.join(", ")));
+                }
             }
         }
 
@@ -581,7 +624,82 @@ mod tests {
         assert!(dql.contains("location.country.name:\"united states\""));
         assert!(dql.contains("nbEmployees>"));
         assert!(dql.contains("not(isDissolved:true)"));
+        // Single location should NOT be wrapped in or()
+        assert!(!dql.contains("or(location.country.name"));
     }
+
+    // ---- FIX #1 TEST: Multiple locations use OR, not AND ----
+
+    #[test]
+    fn test_build_dql_multiple_locations_use_or() {
+        let request = ApolloOrgSearchRequest {
+            organization_locations: Some(vec![
+                "United States".to_string(),
+                "Germany".to_string(),
+                "France".to_string(),
+            ]),
+            ..default_request()
+        };
+
+        let dql = DiffbotClient::build_dql_query(&request);
+
+        // Multiple locations MUST be wrapped in or() — NOT separate AND clauses
+        assert!(
+            dql.contains("or(location.country.name:\"united states\", location.country.name:\"germany\", location.country.name:\"france\")"),
+            "Expected or() wrapper for multiple locations, got: {}",
+            dql
+        );
+    }
+
+    #[test]
+    fn test_build_dql_single_location_no_or_wrapper() {
+        let request = ApolloOrgSearchRequest {
+            organization_locations: Some(vec!["Canada".to_string()]),
+            ..default_request()
+        };
+
+        let dql = DiffbotClient::build_dql_query(&request);
+        assert!(dql.contains("location.country.name:\"canada\""));
+        assert!(!dql.contains("or(location.country.name"));
+    }
+
+    // ---- FIX #2 TEST: Excluded locations ----
+
+    #[test]
+    fn test_build_dql_excluded_locations_single() {
+        let request = ApolloOrgSearchRequest {
+            organization_locations: Some(vec!["United States".to_string()]),
+            organization_not_locations: Some(vec!["China".to_string()]),
+            ..default_request()
+        };
+
+        let dql = DiffbotClient::build_dql_query(&request);
+        assert!(
+            dql.contains("not(location.country.name:\"china\")"),
+            "Expected excluded location, got: {}",
+            dql
+        );
+    }
+
+    #[test]
+    fn test_build_dql_excluded_locations_multiple() {
+        let request = ApolloOrgSearchRequest {
+            organization_not_locations: Some(vec![
+                "China".to_string(),
+                "Russia".to_string(),
+            ]),
+            ..default_request()
+        };
+
+        let dql = DiffbotClient::build_dql_query(&request);
+        assert!(
+            dql.contains("not(or(location.country.name:\"china\", location.country.name:\"russia\"))"),
+            "Expected not(or(...)) for excluded locations, got: {}",
+            dql
+        );
+    }
+
+    // ---- Existing tests (unchanged) ----
 
     #[test]
     fn test_build_dql_with_industry_and_keywords() {
@@ -702,6 +820,33 @@ mod tests {
         assert!(dql.contains("not(or("));
         assert!(dql.contains("description:\"residential\""));
         assert!(dql.contains("description:\"home renovation\""));
+    }
+
+    // ---- FIX #1+#2 COMBINED TEST: V2 expansion with excluded locations ----
+
+    #[test]
+    fn test_build_dql_v2_expansion_with_exclusions() {
+        let request = ApolloOrgSearchRequest {
+            organization_industry_tag_ids: Some(vec!["Software Companies".to_string()]),
+            organization_locations: Some(vec![
+                "United States".to_string(),
+                "Germany".to_string(),
+                "France".to_string(),
+            ]),
+            organization_not_locations: Some(vec!["China".to_string()]),
+            organization_num_employees_ranges: Some(vec!["51-200".to_string()]),
+            ..default_request()
+        };
+
+        let dql = DiffbotClient::build_dql_query(&request);
+
+        // Locations should be OR'd
+        assert!(dql.contains("or(location.country.name:\"united states\""));
+        assert!(dql.contains("location.country.name:\"germany\""));
+        assert!(dql.contains("location.country.name:\"france\""));
+
+        // Excluded location should be NOT'd
+        assert!(dql.contains("not(location.country.name:\"china\")"));
     }
 
     #[test]

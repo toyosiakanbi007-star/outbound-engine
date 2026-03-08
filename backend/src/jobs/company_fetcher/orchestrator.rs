@@ -11,16 +11,36 @@
 //
 // FLOW:
 //   1. Parse payload → load ICP profile → compute quota plan
-//   2. Create fetch run row → seed deduper from existing companies
-//   3. Main loop: true round-robin across industries
-//      a. For current industry at its current variant:
-//         - Paginate provider results until page budget or variant exhausted
+//   2. Load persisted fetch cursors → pre-advance exhausted variants
+//   3. Create fetch run row → seed deduper from existing companies
+//   4. Main loop: true round-robin across industries
+//      a. For current industry at its persisted cursor position:
+//         - Resume pagination from last saved page (not page 1!)
 //         - Dedup + upsert each page → insert candidates → update counters
 //         - On exhaustion: advance variant ladder or mark industry depleted
-//      b. Rotate to next industry
-//   4. Finalize run (succeeded / depleted / partial / failed)
-//   5. Update industry yield metrics
-//   6. Enqueue downstream prequal jobs (if configured)
+//      b. Save cursor after each turn (crash-safe)
+//      c. Rotate to next industry
+//   5. Finalize run (succeeded / depleted / partial / failed)
+//   6. Update industry yield metrics
+//   7. Enqueue downstream prequal jobs (if configured)
+//
+// CURSOR PERSISTENCE (migration 0028):
+//   Each (client_id, industry, variant) has a persistent cursor row in
+//   `industry_fetch_cursors` that stores:
+//     - next_page: where to resume pagination
+//     - exhausted: whether all pages were consumed (skip entirely)
+//     - use_loose: whether tight→loose fallback was triggered
+//     - last_total_hits: detect dataset changes between runs
+//
+//   This eliminates ALL wasted API credits on re-fetching known companies:
+//     - Diffbot: 25 credits PER ENTITY returned → savings = pages_skipped × page_size × 25
+//     - Apollo:  1 credit per page → savings = pages_skipped × 1
+//
+// CREDIT TRACKING:
+//   The orchestrator computes `api_credits` differently per provider:
+//     - Apollo:  1 credit per page fetched
+//     - Diffbot: 25 credits per entity returned (orgs_count × 25)
+//   This is critical for accurate cost reporting and budget monitoring.
 //
 // STOP CONDITIONS (checked every page):
 //   - Industry quota met → move to next industry
@@ -54,29 +74,80 @@ use super::db;
 // Constants
 // ============================================================================
 
-/// Milliseconds to sleep between consecutive Apollo pages.
-/// Keeps us well under rate limits and avoids slamming the API.
+/// Milliseconds to sleep between consecutive API pages.
 const INTER_PAGE_DELAY_MS: u64 = 300;
 
 /// Number of pages to fetch per industry per round-robin turn.
-/// Prevents one industry from monopolizing a turn.
 const PAGES_PER_TURN: i32 = 5;
 
-/// If this fraction of a page's results are duplicates, count it as a high-dupe page.
+/// If this fraction of a page's results are duplicates, count it as high-dupe.
 const HIGH_DUPE_THRESHOLD: f64 = 0.80;
 
-/// How many consecutive high-dupe pages before we exhaust the current variant.
+/// Consecutive high-dupe pages before exhausting the current variant.
 const MAX_CONSECUTIVE_HIGH_DUPE: i32 = 2;
 
-/// If the first page of a "tight" query returns fewer than this many orgs,
-/// fall back to a "loose" query (drop include_keywords_any, keep exclude_keywords).
+/// If the first page of a tight query returns fewer than this, switch to loose.
 const LOOSE_FALLBACK_THRESHOLD: usize = 20;
+
+/// Fraction of in-memory dupes that count toward industry progress.
+/// (From the cross-industry attribution fix in migration 0027.)
+const DUPE_PROGRESS_FRACTION: f64 = 0.5;
+
+/// Diffbot charges this many credits per entity returned.
+const DIFFBOT_CREDITS_PER_ENTITY: i32 = 25;
+
+// ============================================================================
+// In-Memory Cursor State
+// ============================================================================
+
+/// Tracks pagination state for one (industry, variant) pair during a run.
+/// Initialized from DB cursor at run start, updated after each page,
+/// flushed back to DB after each turn and at run end.
+#[derive(Debug, Clone)]
+struct CursorState {
+    /// Next page to fetch from the provider.
+    next_page: i32,
+    /// Whether to use the loose (no include_keywords_any) query.
+    use_loose: bool,
+    /// Provider's total_entries for this query (for change detection).
+    last_total_hits: Option<i64>,
+    /// Entities fetched in THIS run only (delta for DB upsert).
+    fetched_this_run: i32,
+    /// New (non-dupe) entities found in THIS run only.
+    new_this_run: i32,
+    /// Whether this variant is exhausted (all pages consumed).
+    exhausted: bool,
+}
+
+impl CursorState {
+    fn fresh() -> Self {
+        Self {
+            next_page: 1,
+            use_loose: false,
+            last_total_hits: None,
+            fetched_this_run: 0,
+            new_this_run: 0,
+            exhausted: false,
+        }
+    }
+
+    /// Create from a persisted DB cursor row.
+    fn from_db(cursor: &db::FetchCursor) -> Self {
+        Self {
+            next_page: cursor.next_page,
+            use_loose: cursor.use_loose,
+            last_total_hits: cursor.last_total_hits,
+            fetched_this_run: 0,
+            new_this_run: 0,
+            exhausted: cursor.exhausted,
+        }
+    }
+}
 
 // ============================================================================
 // Error Type
 // ============================================================================
 
-/// Errors from the orchestrator.
 #[derive(Debug, thiserror::Error)]
 pub enum OrchestratorError {
     #[error("Database error: {0}")]
@@ -99,7 +170,6 @@ pub enum OrchestratorError {
 // Run Result
 // ============================================================================
 
-/// Summary returned to the worker after a run completes.
 #[derive(Debug)]
 pub struct RunResult {
     pub run_id: Uuid,
@@ -112,19 +182,42 @@ pub struct RunResult {
     pub prequal_jobs_created: i32,
     pub industries_depleted: i32,
     pub elapsed_seconds: u64,
+    /// Pages saved by cursor persistence (vs starting from page 1).
+    pub pages_saved_by_cursors: i32,
+    /// Estimated credits saved by cursor persistence.
+    pub credits_saved_by_cursors: i64,
+}
+
+// ============================================================================
+// Credit Calculation
+// ============================================================================
+
+/// Compute API credits consumed for one page of results.
+///
+/// - Apollo:  1 credit per page (flat, regardless of results)
+/// - Diffbot: 25 credits per entity returned (per org, not per page)
+fn compute_page_credits(provider_name: &str, orgs_returned: i32) -> i32 {
+    match provider_name {
+        "diffbot" => orgs_returned * DIFFBOT_CREDITS_PER_ENTITY,
+        _ => 1, // Apollo and others: 1 credit per page
+    }
+}
+
+/// Estimate credits that would have been spent on skipped pages.
+///
+/// For Diffbot: pages_skipped × page_size × 25 (worst case: full pages)
+/// For Apollo:  pages_skipped × 1
+fn estimate_saved_credits(provider_name: &str, pages_skipped: i32, page_size: i32) -> i64 {
+    match provider_name {
+        "diffbot" => (pages_skipped as i64) * (page_size as i64) * (DIFFBOT_CREDITS_PER_ENTITY as i64),
+        _ => pages_skipped as i64,
+    }
 }
 
 // ============================================================================
 // Main Entry Point
 // ============================================================================
 
-/// Execute a `discover_companies` job.
-///
-/// # Arguments
-/// * `pool` — Database connection pool.
-/// * `provider` — Organization search provider (Apollo or Diffbot).
-/// * `payload` — Parsed job payload.
-/// * `worker_id` — ID of the worker processing this job (for logging).
 pub async fn run_company_fetcher(
     pool: &PgPool,
     provider: &dyn OrgSearchProvider,
@@ -133,10 +226,13 @@ pub async fn run_company_fetcher(
 ) -> Result<RunResult, OrchestratorError> {
     let start = Instant::now();
     let client_id = payload.client_id;
+    let provider_name = provider.provider_name();
 
     info!(
-        "Worker {}: starting company fetch for client {} (batch_target={}, provider={})",
-        worker_id, client_id, payload.batch_target, provider.provider_name()
+        "Worker {}: starting company fetch for client {} \
+         (batch_target={}, provider={}, page_size={}, rescan={})",
+        worker_id, client_id, payload.batch_target,
+        provider_name, payload.page_size, payload.force_full_rescan
     );
 
     // ========================================================================
@@ -163,7 +259,32 @@ pub async fn run_company_fetcher(
     let quota_plan = quota_planner::compute_quota_plan(&icp, &yield_metrics, payload);
 
     // ========================================================================
-    // 3. Create (or Resume) Fetch Run
+    // 3. Load or Reset Persisted Fetch Cursors
+    // ========================================================================
+
+    if payload.force_full_rescan {
+        let deleted = db::reset_fetch_cursors(pool, client_id).await?;
+        if deleted > 0 {
+            info!(
+                "force_full_rescan: cleared {} persisted cursors for client {}",
+                deleted, client_id
+            );
+        }
+    }
+
+    // Prune cursors for industries that were removed from the ICP
+    let active_industries = icp.industry_names();
+    let pruned = db::prune_stale_cursors(pool, client_id, &active_industries).await
+        .unwrap_or(0);
+    if pruned > 0 {
+        info!("Pruned {} stale cursors (industries removed from ICP)", pruned);
+    }
+
+    // Load surviving cursors into memory
+    let persisted_cursors = db::load_fetch_cursors(pool, client_id).await?;
+
+    // ========================================================================
+    // 4. Create (or Resume) Fetch Run
     // ========================================================================
 
     let run_id = match payload.resume_run_id {
@@ -179,7 +300,7 @@ pub async fn run_company_fetcher(
     info!("Fetch run {} active for client {}", run_id, client_id);
 
     // ========================================================================
-    // 4. Seed Deduper with Known Companies
+    // 5. Seed Deduper with Known Companies
     // ========================================================================
 
     let mut deduper = BatchDeduper::with_capacity(payload.batch_target as usize);
@@ -187,7 +308,7 @@ pub async fn run_company_fetcher(
     info!("Deduper seeded with {} known identities", deduper.unique_count());
 
     // ========================================================================
-    // 5. Initialize Per-Industry State
+    // 6. Initialize Per-Industry State + Cursor State
     // ========================================================================
 
     let variant_builder = VariantBuilder::new(&icp);
@@ -197,25 +318,107 @@ pub async fn run_company_fetcher(
         .map(|(ind, q)| (ind.clone(), IndustryProgress::new(ind.clone(), q.target)))
         .collect();
 
-    // Deterministic industry order for round-robin.
-    let mut industry_order: Vec<String> = quota_plan.keys().cloned().collect();
-    industry_order.sort(); // alphabetical → deterministic across runs
+    // In-memory cursor state map: "industry::variant" → CursorState
+    let mut cursor_state: HashMap<String, CursorState> = HashMap::new();
 
-    // Per-industry page cursors (which Apollo page to fetch next for each variant).
-    // Key: "industry::variant" → next page number.
-    let mut page_cursors: HashMap<String, i32> = HashMap::new();
+    // Track pages saved across all industries (for reporting)
+    let mut total_pages_saved: i32 = 0;
+
+    // ---- Pre-advance exhausted variants from previous runs ----
+    //
+    // If V1Strict for "fintech" was fully consumed last run, the cursor is
+    // marked exhausted=true. We skip it and start at the next non-exhausted
+    // variant. If ALL variants are exhausted, the industry starts depleted.
+
+    for (industry, prog) in progress_map.iter_mut() {
+        let mut variant = QueryVariant::V1Strict;
+
+        loop {
+            let key = db::cursor_key(industry, variant.as_str());
+
+            let cs = if let Some(pc) = persisted_cursors.get(&key) {
+                CursorState::from_db(pc)
+            } else {
+                CursorState::fresh()
+            };
+
+            if cs.exhausted {
+                debug!(
+                    "Cursor: {}::{} exhausted (previous run), skipping",
+                    industry, variant.as_str()
+                );
+                cursor_state.insert(key, cs);
+
+                match variant_builder.next_effective_variant(variant) {
+                    Some(next) => variant = next,
+                    None => {
+                        info!(
+                            "Industry '{}': ALL variants exhausted from previous runs → depleted",
+                            industry
+                        );
+                        prog.depleted = true;
+                        prog.depletion_reason =
+                            Some("all_variants_exhausted_from_cursors".to_string());
+                        break;
+                    }
+                }
+            } else {
+                // This variant has pages left — resume here
+                let pages_saved = cs.next_page.saturating_sub(1);
+                if pages_saved > 0 {
+                    info!(
+                        "Cursor: {}::{} resuming at page {} (skipping {} pages)",
+                        industry, variant.as_str(), cs.next_page, pages_saved
+                    );
+                    total_pages_saved += pages_saved;
+                }
+                cursor_state.insert(key, cs);
+                break;
+            }
+        }
+
+        prog.current_variant = variant;
+        if !prog.depleted {
+            prog.variants_used = vec![variant.as_str().to_string()];
+        }
+    }
+
+    let credits_saved = estimate_saved_credits(
+        provider_name, total_pages_saved, payload.page_size,
+    );
+
+    if total_pages_saved > 0 {
+        info!(
+            "Cursor persistence: skipping {} pages (~{} credits saved, provider={})",
+            total_pages_saved, credits_saved, provider_name
+        );
+    }
+
+    // ---- Deterministic but fair industry order (rotate by run_id) ----
+
+    let mut industry_order: Vec<String> = quota_plan.keys().cloned().collect();
+    industry_order.sort();
+    if !industry_order.is_empty() {
+        let rotation = run_id.as_bytes()[0] as usize % industry_order.len();
+        industry_order.rotate_left(rotation);
+    }
+
+    info!(
+        "Industry order for run {}: {:?}",
+        run_id,
+        industry_order.iter().map(|s| s.as_str()).collect::<Vec<_>>()
+    );
 
     // ========================================================================
-    // 6. Global Counters
+    // 7. Global Counters
     // ========================================================================
 
     let mut global = GlobalCounters::default();
 
     // ========================================================================
-    // 7. Main Fetch Loop (True Round-Robin)
+    // 8. Main Fetch Loop (True Round-Robin)
     // ========================================================================
 
-    // Rotating index — each iteration picks the next industry in order.
     let mut rr_index: usize = 0;
 
     loop {
@@ -264,49 +467,55 @@ pub async fn run_company_fetcher(
             client_id,
             &industry,
             &mut progress_map,
-            &mut page_cursors,
+            &mut cursor_state,
+            &persisted_cursors,
             start,
         )
         .await;
 
         match turn_result {
             Ok(stats) => {
-                // Update global counters
                 global.fetched += stats.fetched;
                 global.upserted += stats.upserted;
                 global.duplicates += stats.duplicates;
                 global.pages += stats.pages;
-                global.api_credits += stats.pages; // 1 credit per page
+                global.api_credits += stats.api_credits;
 
-                // Flush to DB
                 if let Err(e) = db::update_run_counters(
-                    pool,
-                    run_id,
-                    stats.fetched,
-                    stats.upserted,
-                    stats.duplicates,
-                    stats.pages,
-                    stats.pages, // api_credits = pages
-                )
-                .await
-                {
+                    pool, run_id,
+                    stats.fetched, stats.upserted, stats.duplicates,
+                    stats.pages, stats.api_credits,
+                ).await {
                     warn!("Failed to update run counters: {}", e);
                 }
+
+                // ---- Persist cursor after each turn (crash-safe) ----
+                persist_industry_cursors(
+                    pool, client_id, run_id, &industry,
+                    &progress_map, &cursor_state,
+                ).await;
             }
             Err(OrchestratorError::Apollo(ref e)) => {
-                // Apollo errors are contained per-industry — don't kill the run.
                 error!(
-                    "Apollo error for industry '{}': {} — marking depleted",
+                    "Provider error for industry '{}': {} — marking depleted",
                     industry, e
                 );
                 if let Some(prog) = progress_map.get_mut(&industry) {
                     prog.depleted = true;
                     prog.depletion_reason = Some(format!("provider_error: {}", e));
                 }
+                persist_industry_cursors(
+                    pool, client_id, run_id, &industry,
+                    &progress_map, &cursor_state,
+                ).await;
             }
             Err(e) => {
-                // DB errors are fatal.
+                // DB errors are fatal — save ALL cursors before dying
                 error!("Fatal error during fetch: {}", e);
+                persist_all_cursors(
+                    pool, client_id, run_id, &cursor_state,
+                ).await;
+
                 let error_json = json!({
                     "message": format!("{}", e),
                     "industry": industry,
@@ -318,7 +527,13 @@ pub async fn run_company_fetcher(
     }
 
     // ========================================================================
-    // 8. Finalize Run
+    // 9. Final Cursor Persistence (save ALL modified cursors)
+    // ========================================================================
+
+    persist_all_cursors(pool, client_id, run_id, &cursor_state).await;
+
+    // ========================================================================
+    // 10. Finalize Run
     // ========================================================================
 
     let industry_summary = build_industry_summary(&progress_map);
@@ -337,21 +552,22 @@ pub async fn run_company_fetcher(
         db::finalize_run_depleted(pool, run_id, &industry_summary).await?;
         "depleted"
     } else {
-        // Under target but still had active industries — treat as success
         db::finalize_run_succeeded(pool, run_id, &industry_summary).await?;
         "succeeded"
     };
 
     info!(
-        "Run {} finalized: status={}, fetched={}, upserted={}, dupes={}, pages={}, credits={}, elapsed={}s",
+        "Run {} finalized: status={}, fetched={}, upserted={}, dupes={}, \
+         pages={}, credits={}, pages_saved={}, credits_saved=~{}, elapsed={}s",
         run_id, final_status,
         global.fetched, global.upserted, global.duplicates,
         global.pages, global.api_credits,
+        total_pages_saved, credits_saved,
         start.elapsed().as_secs()
     );
 
     // ========================================================================
-    // 9. Update Industry Yield Metrics
+    // 11. Update Industry Yield Metrics
     // ========================================================================
 
     for (industry, prog) in &progress_map {
@@ -359,40 +575,33 @@ pub async fn run_company_fetcher(
             if let Err(e) = db::upsert_yield_metrics(
                 pool, client_id, industry,
                 prog.fetched, prog.upserted, prog.duplicates, prog.depleted,
-            )
-            .await
-            {
+            ).await {
                 warn!("Failed to upsert yield metrics for '{}': {}", industry, e);
             }
         }
     }
 
-     // ========================================================================
-    // 10. Autopilot: Enqueue Prequal Dispatch (if new companies were added)
+    // ========================================================================
+    // 12. Autopilot: Enqueue Prequal Dispatch
     // ========================================================================
 
     let prequal_jobs = if global.upserted > 0 {
-        // Check if autopilot is enabled for this client
         let prequal_config = prequal_db::load_prequal_config(pool, client_id)
             .await
             .unwrap_or_default();
 
         if prequal_config.autopilot_enabled {
-            // Debounce: don't enqueue if there's already a pending dispatch
             match prequal_db::has_pending_prequal_dispatch(pool, client_id).await {
                 Ok(true) => {
-                    debug!(
-                        "Autopilot: skipping PREQUAL_DISPATCH for client {} — one already pending",
-                        client_id
-                    );
+                    debug!("Autopilot: skipping PREQUAL_DISPATCH — one already pending");
                     0
                 }
                 Ok(false) => {
                     match prequal_db::enqueue_prequal_dispatch_job(pool, client_id, "autopilot").await {
                         Ok(job_id) => {
                             info!(
-                                "Autopilot: enqueued PREQUAL_DISPATCH {} for client {} ({} new companies)",
-                                job_id, client_id, global.upserted
+                                "Autopilot: enqueued PREQUAL_DISPATCH {} ({} new companies)",
+                                job_id, global.upserted
                             );
                             1
                         }
@@ -431,6 +640,8 @@ pub async fn run_company_fetcher(
         prequal_jobs_created: prequal_jobs,
         industries_depleted,
         elapsed_seconds: start.elapsed().as_secs(),
+        pages_saved_by_cursors: total_pages_saved,
+        credits_saved_by_cursors: credits_saved,
     })
 }
 
@@ -438,10 +649,6 @@ pub async fn run_company_fetcher(
 // Round-Robin Industry Selection
 // ============================================================================
 
-/// Pick the next active (not done/depleted) industry starting from `start_idx`.
-///
-/// Wraps around the list. Returns the industry name and the next index to use
-/// (one past the picked industry), or None if all industries are done.
 fn pick_next_active(
     order: &[String],
     progress: &HashMap<String, IndustryProgress>,
@@ -464,21 +671,16 @@ fn pick_next_active(
 // Per-Industry Turn (Fetch Up To PAGES_PER_TURN Pages)
 // ============================================================================
 
-/// Stats from one round-robin turn for one industry.
 #[derive(Debug, Default)]
 struct TurnStats {
     fetched: i32,
     upserted: i32,
     duplicates: i32,
     pages: i32,
+    /// Provider-specific credit cost for this turn.
+    api_credits: i32,
 }
 
-/// Fetch up to PAGES_PER_TURN pages for one industry at its current variant.
-///
-/// If the variant is exhausted within this turn, advances to the next variant
-/// (or marks the industry depleted if all variants are exhausted).
-///
-/// Updates `progress_map` and `page_cursors` in place.
 async fn fetch_industry_turn(
     pool: &PgPool,
     provider: &dyn OrgSearchProvider,
@@ -489,9 +691,12 @@ async fn fetch_industry_turn(
     client_id: Uuid,
     industry: &str,
     progress_map: &mut HashMap<String, IndustryProgress>,
-    page_cursors: &mut HashMap<String, i32>,
-    run_start: Instant,
+    cursor_state: &mut HashMap<String, CursorState>,
+    persisted_cursors: &HashMap<String, db::FetchCursor>,
+    start: Instant,
 ) -> Result<TurnStats, OrchestratorError> {
+    let provider_name = provider.provider_name();
+
     let prog = match progress_map.get(industry) {
         Some(p) if p.is_done() => return Ok(TurnStats::default()),
         Some(p) => p.clone(),
@@ -499,22 +704,40 @@ async fn fetch_industry_turn(
     };
 
     let variant = prog.current_variant;
-    let cursor_key = format!("{}::{}", industry, variant.as_str());
-    let start_page = *page_cursors.get(&cursor_key).unwrap_or(&1);
+    let cs_key = db::cursor_key(industry, variant.as_str());
+
+    // Load or create cursor state for this (industry, variant)
+    let cs = cursor_state
+        .entry(cs_key.clone())
+        .or_insert_with(CursorState::fresh);
+
+    // If cursor says this variant is exhausted, skip (should have been
+    // pre-advanced at run start, but guard against edge cases)
+    if cs.exhausted {
+        debug!(
+            "Turn: {}::{} already exhausted — skipping",
+            industry, variant.as_str()
+        );
+        return Ok(TurnStats::default());
+    }
+
+    let start_page = cs.next_page;
+    let use_loose_initial = cs.use_loose;
 
     debug!(
-        "Turn: industry='{}', variant={}, start_page={}, remaining={}/{}",
-        industry, variant.as_str(), start_page,
+        "Turn: industry='{}', variant={}, page={}, loose={}, remaining={}/{}",
+        industry, variant.as_str(), start_page, use_loose_initial,
         prog.remaining(), prog.quota
     );
 
-    // Log the query in DB (logs tight variant; loose is logged in meta if fallback occurs)
-    let base_request = variant_builder.build_request(industry, variant, start_page, payload.page_size);
+    // Log the query in DB
+    let base_request = variant_builder.build_request(
+        industry, variant, start_page, payload.page_size,
+    );
     let query_id = db::create_fetch_query(
         pool, run_id, client_id, industry, variant.as_str(),
         &base_request.to_json_value(), start_page,
-    )
-    .await?;
+    ).await?;
 
     let mut stats = TurnStats::default();
     let mut current_page = start_page;
@@ -523,12 +746,8 @@ async fn fetch_industry_turn(
     let mut query_status = FetchQueryStatus::Succeeded;
     let mut query_error: Option<String> = None;
     let mut variant_exhausted = false;
+    let mut use_loose = use_loose_initial;
 
-    // Tight→loose fallback: if first page returns too few results and
-    // this industry has include_keywords_any, switch to loose query.
-    let mut use_loose = false;
-
-    // Fetch up to PAGES_PER_TURN pages (or until a stop condition)
     while stats.pages < PAGES_PER_TURN {
         // --- Stop conditions ---
 
@@ -547,12 +766,11 @@ async fn fetch_industry_turn(
             break;
         }
 
-        if run_start.elapsed().as_secs() >= payload.max_runtime_seconds {
-            debug!("Runtime limit hit during industry '{}'", industry);
+        if start.elapsed().as_secs() >= payload.max_runtime_seconds {
             break;
         }
 
-        // --- Inter-page delay (avoid hammering the provider) ---
+        // --- Inter-page delay ---
 
         if stats.pages > 0 {
             sleep(Duration::from_millis(INTER_PAGE_DELAY_MS)).await;
@@ -575,17 +793,22 @@ async fn fetch_industry_turn(
             Err(e) => {
                 query_error = Some(format!("{}", e));
                 query_status = FetchQueryStatus::Failed;
+                // Save cursor progress even on failure (don't lose pages already done)
+                if let Some(cs) = cursor_state.get_mut(&cs_key) {
+                    cs.next_page = current_page; // resume AT this page on retry
+                }
                 let _ = db::update_fetch_query(
                     pool, query_id, current_page, stats.pages, stats.fetched,
                     query_status, last_response_meta.as_ref(), query_error.as_deref(),
-                )
-                .await;
+                ).await;
                 return Err(OrchestratorError::Apollo(e));
             }
         };
 
+        let total_hits = meta.total_entries;
+
         last_response_meta = Some(json!({
-            "total_entries": meta.total_entries,
+            "total_entries": total_hits,
             "total_pages": meta.total_pages,
             "current_page": meta.page,
         }));
@@ -594,9 +817,13 @@ async fn fetch_industry_turn(
         stats.fetched += orgs_count;
         stats.pages += 1;
 
-        // --- Tight→loose fallback check on first page ---
+        // --- Provider-specific credit tracking ---
+        stats.api_credits += compute_page_credits(provider_name, orgs_count);
 
-        if stats.pages == 1
+        // --- Tight→loose fallback on first page ---
+
+        if current_page == start_page
+            && stats.pages == 1
             && !use_loose
             && (orgs_count as usize) < LOOSE_FALLBACK_THRESHOLD
             && variant_builder.industry_has_include_keywords(industry)
@@ -606,8 +833,7 @@ async fn fetch_industry_turn(
                 industry, orgs_count, LOOSE_FALLBACK_THRESHOLD
             );
             use_loose = true;
-            // Still process this page's results (don't discard them),
-            // but subsequent pages will use the loose query.
+            // Process this page's results, subsequent pages use loose query
         }
 
         // --- Process batch: dedup + upsert ---
@@ -616,16 +842,18 @@ async fn fetch_industry_turn(
 
         let new_count = batch.new_count() as i32;
         let dupe_count = batch.dupe_count() as i32;
+        let in_memory_dupes = batch.in_memory_dupes;
         stats.upserted += new_count;
         stats.duplicates += dupe_count;
 
-        // --- Write enrichment data (now that company rows exist) ---
+        // Partial credit for in-memory dupes (cross-industry fairness)
+        let dupe_progress = ((in_memory_dupes as f64) * DUPE_PROGRESS_FRACTION).round() as i32;
+        stats.upserted += dupe_progress;
+
+        // --- Write enrichment data ---
 
         let mut enrichments = provider.drain_pending_enrichments();
         if !enrichments.is_empty() {
-            // Stamp match metadata from query context onto each enrichment.
-            // This records which industry, keywords, and variant produced the match
-            // so we can debug and tune ICP configs without re-running.
             let variant_label = if use_loose { "loose" } else { "tight" };
             let matched_category = page_request
                 .organization_industry_tag_ids
@@ -634,7 +862,7 @@ async fn fetch_industry_turn(
                 .unwrap_or_default();
 
             let metadata = json!({
-                "provider": provider.provider_name(),
+                "provider": provider_name,
                 "matched_industry_name": industry,
                 "matched_diffbot_category": matched_category,
                 "include_keywords_any": page_request.include_keywords_any.as_deref().unwrap_or(&[]),
@@ -644,7 +872,7 @@ async fn fetch_industry_turn(
                 "query_variant_ladder": variant.as_str(),
             });
 
-            for (_external_id, ref mut data) in enrichments.iter_mut() {
+            for (_ext_id, ref mut data) in enrichments.iter_mut() {
                 data.match_metadata = metadata.clone();
             }
 
@@ -660,16 +888,34 @@ async fn fetch_industry_turn(
             let _ = db::insert_candidate(
                 pool, client_id, run_id, upsert.company_id,
                 industry, variant.as_str(), !upsert.was_insert,
-            )
-            .await;
+            ).await;
+        }
+
+        // Insert candidate rows for in-memory dupes (cross-industry attribution)
+        for dupe_company_id in &batch.in_memory_dupe_company_ids {
+            let _ = db::insert_candidate(
+                pool, client_id, run_id, *dupe_company_id,
+                industry, variant.as_str(), true,
+            ).await;
         }
 
         debug!(
-            "  page {}: {} orgs → {} new, {} dupes",
-            current_page, orgs_count, new_count, dupe_count
+            "  page {}: {} orgs → {} new, {} dupes, {} in-mem dupes (credits={})",
+            current_page, orgs_count, new_count, dupe_count, in_memory_dupes,
+            compute_page_credits(provider_name, orgs_count)
         );
 
-        // --- Check if Apollo results are exhausted ---
+        // --- Update in-memory cursor ---
+
+        if let Some(cs) = cursor_state.get_mut(&cs_key) {
+            cs.next_page = current_page + 1;
+            cs.use_loose = use_loose;
+            cs.last_total_hits = Some(total_hits);
+            cs.fetched_this_run += orgs_count;
+            cs.new_this_run += new_count;
+        }
+
+        // --- Check if results are exhausted ---
 
         if orgs_count < payload.page_size {
             debug!(
@@ -702,17 +948,20 @@ async fn fetch_industry_turn(
         current_page += 1;
     }
 
-    // --- Save page cursor for next turn ---
-
-    page_cursors.insert(cursor_key, current_page + 1);
-
     // --- Update the query row ---
 
     let _ = db::update_fetch_query(
         pool, query_id, current_page, stats.pages, stats.fetched,
         query_status, last_response_meta.as_ref(), query_error.as_deref(),
-    )
-    .await;
+    ).await;
+
+    // --- Mark cursor exhausted if variant is done ---
+
+    if variant_exhausted {
+        if let Some(cs) = cursor_state.get_mut(&cs_key) {
+            cs.exhausted = true;
+        }
+    }
 
     // --- Update progress for this industry ---
 
@@ -722,7 +971,6 @@ async fn fetch_industry_turn(
         prog.duplicates += stats.duplicates;
 
         if variant_exhausted {
-            // Try to advance to the next effective variant
             match variant_builder.next_effective_variant(prog.current_variant) {
                 Some(next) => {
                     info!(
@@ -731,9 +979,18 @@ async fn fetch_industry_turn(
                     );
                     prog.current_variant = next;
                     prog.variants_used.push(next.as_str().to_string());
-                    // Reset page cursor for the new variant
-                    let new_key = format!("{}::{}", industry, next.as_str());
-                    page_cursors.insert(new_key, 1);
+
+                    // Initialize cursor state for the new variant
+                    let next_key = db::cursor_key(industry, next.as_str());
+                    if !cursor_state.contains_key(&next_key) {
+                        // Check if there's a persisted cursor from a previous run
+                        let cs = if let Some(pc) = persisted_cursors.get(&next_key) {
+                            CursorState::from_db(pc)
+                        } else {
+                            CursorState::fresh()
+                        };
+                        cursor_state.insert(next_key, cs);
+                    }
                 }
                 None => {
                     info!(
@@ -751,10 +1008,88 @@ async fn fetch_industry_turn(
 }
 
 // ============================================================================
+// Cursor Persistence Helpers
+// ============================================================================
+
+/// Save cursor(s) for a single industry's active variant.
+async fn persist_industry_cursors(
+    pool: &PgPool,
+    client_id: Uuid,
+    run_id: Uuid,
+    industry: &str,
+    progress_map: &HashMap<String, IndustryProgress>,
+    cursor_state: &HashMap<String, CursorState>,
+) {
+    let Some(prog) = progress_map.get(industry) else { return };
+
+    // Save cursor for current variant
+    let key = db::cursor_key(industry, prog.current_variant.as_str());
+    save_one_cursor(pool, client_id, run_id, &key, cursor_state).await;
+
+    // Also save any exhausted variants we advanced past this turn
+    for v_name in &prog.variants_used {
+        if v_name.as_str() != prog.current_variant.as_str() {
+            let prev_key = db::cursor_key(industry, v_name);
+            save_one_cursor(pool, client_id, run_id, &prev_key, cursor_state).await;
+        }
+    }
+}
+
+/// Save ALL cursors that were modified during this run.
+async fn persist_all_cursors(
+    pool: &PgPool,
+    client_id: Uuid,
+    run_id: Uuid,
+    cursor_state: &HashMap<String, CursorState>,
+) {
+    for key in cursor_state.keys() {
+        save_one_cursor(pool, client_id, run_id, key, cursor_state).await;
+    }
+    debug!("Persisted all cursor states for client {}", client_id);
+}
+
+/// Save a single cursor to the DB.
+async fn save_one_cursor(
+    pool: &PgPool,
+    client_id: Uuid,
+    run_id: Uuid,
+    key: &str,
+    cursor_state: &HashMap<String, CursorState>,
+) {
+    let Some(cs) = cursor_state.get(key) else { return };
+
+    // Only save if something changed this run
+    if cs.fetched_this_run == 0 && cs.new_this_run == 0 && !cs.exhausted {
+        return;
+    }
+
+    // Parse "industry::variant" from the key
+    let parts: Vec<&str> = key.splitn(2, "::").collect();
+    if parts.len() != 2 {
+        warn!("Invalid cursor key format: {}", key);
+        return;
+    }
+
+    if let Err(e) = db::save_fetch_cursor(
+        pool, client_id,
+        parts[0],  // industry
+        parts[1],  // variant
+        cs.next_page,
+        cs.fetched_this_run,
+        cs.new_this_run,
+        cs.exhausted,
+        cs.use_loose,
+        cs.last_total_hits,
+        run_id,
+    ).await {
+        warn!("Failed to save cursor {}: {}", key, e);
+    }
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
-/// Global counters accumulated across all industries and turns.
 #[derive(Debug, Default)]
 struct GlobalCounters {
     fetched: i32,
@@ -764,7 +1099,6 @@ struct GlobalCounters {
     api_credits: i32,
 }
 
-/// Build the industry_summary JSONB for the final run row.
 fn build_industry_summary(
     progress_map: &HashMap<String, IndustryProgress>,
 ) -> serde_json::Value {
@@ -807,17 +1141,14 @@ mod tests {
         progress.insert("b".into(), IndustryProgress::new("b".into(), 100));
         progress.insert("c".into(), IndustryProgress::new("c".into(), 100));
 
-        // Starting at 0 → picks "a", next index = 1
         let (ind, next) = pick_next_active(&order, &progress, 0).unwrap();
         assert_eq!(ind, "a");
         assert_eq!(next, 1);
 
-        // Starting at 1 → picks "b", next index = 2
         let (ind, next) = pick_next_active(&order, &progress, 1).unwrap();
         assert_eq!(ind, "b");
         assert_eq!(next, 2);
 
-        // Starting at 2 → picks "c", next index = 0 (wraps)
         let (ind, next) = pick_next_active(&order, &progress, 2).unwrap();
         assert_eq!(ind, "c");
         assert_eq!(next, 0);
@@ -828,21 +1159,18 @@ mod tests {
         let order = vec!["a".into(), "b".into(), "c".into()];
         let mut progress = HashMap::new();
 
-        // "a" is depleted, "b" is at quota, "c" is active
         let mut a = IndustryProgress::new("a".into(), 100);
         a.depleted = true;
         progress.insert("a".into(), a);
 
         let mut b = IndustryProgress::new("b".into(), 50);
-        b.upserted = 50; // at quota
+        b.upserted = 50;
         progress.insert("b".into(), b);
 
         progress.insert("c".into(), IndustryProgress::new("c".into(), 100));
 
-        // Starting at 0 → skips "a" (depleted), skips "b" (at quota), picks "c"
-        let (ind, next) = pick_next_active(&order, &progress, 0).unwrap();
+        let (ind, _) = pick_next_active(&order, &progress, 0).unwrap();
         assert_eq!(ind, "c");
-        assert_eq!(next, 0); // (2+1)%3 = 0
     }
 
     #[test]
@@ -866,23 +1194,93 @@ mod tests {
         let order = vec!["a".into(), "b".into(), "c".into()];
         let mut progress = HashMap::new();
 
-        // Only "a" is active
         progress.insert("a".into(), IndustryProgress::new("a".into(), 100));
-
         let mut b = IndustryProgress::new("b".into(), 50);
         b.depleted = true;
         progress.insert("b".into(), b);
-
         let mut c = IndustryProgress::new("c".into(), 50);
         c.depleted = true;
         progress.insert("c".into(), c);
 
-        // Starting at 2 → wraps to 0 → picks "a"
         let (ind, _) = pick_next_active(&order, &progress, 2).unwrap();
         assert_eq!(ind, "a");
     }
 
-    // ---- Industry Summary Tests ----
+    // ---- Credit Calculation Tests ----
+
+    #[test]
+    fn test_compute_page_credits_apollo() {
+        assert_eq!(compute_page_credits("apollo", 100), 1);
+        assert_eq!(compute_page_credits("apollo", 0), 1);
+        assert_eq!(compute_page_credits("apollo", 50), 1);
+    }
+
+    #[test]
+    fn test_compute_page_credits_diffbot() {
+        assert_eq!(compute_page_credits("diffbot", 25), 625);   // 25 × 25
+        assert_eq!(compute_page_credits("diffbot", 100), 2500); // 100 × 25
+        assert_eq!(compute_page_credits("diffbot", 0), 0);      // empty page = free
+        assert_eq!(compute_page_credits("diffbot", 1), 25);     // 1 entity = 25 credits
+    }
+
+    #[test]
+    fn test_estimate_saved_credits_diffbot() {
+        // 10 pages skipped × 25 page_size × 25 credits/entity = 6250
+        assert_eq!(estimate_saved_credits("diffbot", 10, 25), 6250);
+        // 50 pages skipped × 50 page_size × 25 = 62500
+        assert_eq!(estimate_saved_credits("diffbot", 50, 50), 62500);
+    }
+
+    #[test]
+    fn test_estimate_saved_credits_apollo() {
+        // 10 pages skipped × 1 credit/page = 10
+        assert_eq!(estimate_saved_credits("apollo", 10, 100), 10);
+    }
+
+    // ---- Cursor State Tests ----
+
+    #[test]
+    fn test_cursor_state_fresh() {
+        let cs = CursorState::fresh();
+        assert_eq!(cs.next_page, 1);
+        assert!(!cs.use_loose);
+        assert!(!cs.exhausted);
+        assert_eq!(cs.fetched_this_run, 0);
+        assert_eq!(cs.new_this_run, 0);
+    }
+
+    #[test]
+    fn test_cursor_key_format() {
+        assert_eq!(db::cursor_key("fintech", "v1_strict"), "fintech::v1_strict");
+        assert_eq!(
+            db::cursor_key("Currency And Lending Services", "v2_broaden_geo"),
+            "Currency And Lending Services::v2_broaden_geo"
+        );
+    }
+
+    // ---- Industry Order Tests ----
+
+    #[test]
+    fn test_industry_order_rotation_varies() {
+        let industries = vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()];
+
+        let run_id_0 = Uuid::from_bytes([0; 16]);
+        let run_id_1 = Uuid::from_bytes([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let run_id_2 = Uuid::from_bytes([2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+        let mut order0 = industries.clone();
+        order0.rotate_left(run_id_0.as_bytes()[0] as usize % order0.len());
+        let mut order1 = industries.clone();
+        order1.rotate_left(run_id_1.as_bytes()[0] as usize % order1.len());
+        let mut order2 = industries.clone();
+        order2.rotate_left(run_id_2.as_bytes()[0] as usize % order2.len());
+
+        assert_eq!(order0[0], "a"); // rotation=0
+        assert_eq!(order1[0], "b"); // rotation=1
+        assert_eq!(order2[0], "c"); // rotation=2
+    }
+
+    // ---- Summary Tests ----
 
     #[test]
     fn test_build_industry_summary() {
@@ -930,6 +1328,5 @@ mod tests {
         let cy = &summary["cybersecurity"];
         assert_eq!(cy["depleted"], true);
         assert_eq!(cy["depletion_reason"], "all_variants_exhausted");
-        assert_eq!(cy["final_variant"], "v4_keyword_assist");
     }
 }

@@ -4,8 +4,15 @@
 //
 // PURPOSE:
 // - Listen for prequal_ready notifications from Azure Function
+// - Update company_candidates.status (belt-and-suspenders alongside DB trigger)
 // - Check if company qualifies for Phase B
 // - Queue PHASE_B_ENRICH_APOLLO job if qualified
+//
+// WHY BELT-AND-SUSPENDERS:
+//   The DB trigger (trg_sync_candidate_status on v3_analysis_runs) is the primary
+//   mechanism for updating company_candidates.status. This listener provides a
+//   secondary path using the NOTIFY payload. If the trigger already ran, the
+//   update here is a no-op (WHERE status IN ('prequal_queued','new') won't match).
 //
 // USAGE:
 // - Run as part of worker: MODE=worker+prequal_listener
@@ -21,11 +28,12 @@ use tracing::{error, info, warn};
 use crate::jobs::phase_b_controller::{
     handle_prequal_notification, PrequalReadyNotification,
 };
+use crate::jobs::prequal_worker::db as prequal_db;
 
 /// Run the prequal listener loop.
 ///
-/// This function runs indefinitely, listening for prequal_ready notifications
-/// and queueing Phase B jobs for qualified companies.
+/// This function runs indefinitely, listening for prequal_ready notifications,
+/// updating candidate status, and queueing Phase B jobs for qualified companies.
 pub async fn run_prequal_listener(pool: PgPool) -> anyhow::Result<()> {
     let channel = std::env::var("PREQUAL_LISTEN_CHANNEL")
         .unwrap_or_else(|_| "prequal_ready".to_string());
@@ -51,6 +59,44 @@ pub async fn run_prequal_listener(pool: PgPool) -> anyhow::Result<()> {
                 
                 match serde_json::from_str::<PrequalReadyNotification>(payload_str) {
                     Ok(prequal) => {
+                        // -----------------------------------------------
+                        // Step 1: Update company_candidates.status
+                        // (belt-and-suspenders: DB trigger is the primary path)
+                        // -----------------------------------------------
+                        match prequal_db::update_candidate_status_by_company(
+                            &pool,
+                            prequal.company_id,
+                            prequal.client_id,
+                            prequal.qualifies,
+                            Some(prequal.score),
+                        )
+                        .await
+                        {
+                            Ok(affected) => {
+                                if affected > 0 {
+                                    info!(
+                                        "Updated candidate status via NOTIFY for company {} (qualifies={}, score={:.2})",
+                                        prequal.company_id, prequal.qualifies, prequal.score
+                                    );
+                                } else {
+                                    // DB trigger likely already handled this — expected and fine
+                                    info!(
+                                        "Candidate already updated (trigger handled it) for company {} (qualifies={})",
+                                        prequal.company_id, prequal.qualifies
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to update candidate status for company {}: {:?} (DB trigger may handle it)",
+                                    prequal.company_id, e
+                                );
+                            }
+                        }
+
+                        // -----------------------------------------------
+                        // Step 2: Queue Phase B if qualified
+                        // -----------------------------------------------
                         match handle_prequal_notification(&pool, &prequal, &worker_id).await {
                             Ok(queued) => {
                                 if queued {

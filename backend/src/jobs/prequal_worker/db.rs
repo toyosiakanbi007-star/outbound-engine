@@ -541,3 +541,103 @@ pub async fn count_prequal_backlog(
 
     Ok(backlog)
 }
+
+// ============================================================================
+// Stale Candidate Recovery (Fire-and-Forget Support)
+// ============================================================================
+
+/// Recover candidates stuck in 'prequal_queued' due to Azure Function timeouts
+/// or crashes that never wrote to v3_analysis_runs.
+///
+/// Calls the DB function recover_stale_prequal_candidates() which resets
+/// stale candidates to 'new' so dispatch can retry them.
+///
+/// Should be called at the start of each PREQUAL_BATCH or PREQUAL_DISPATCH.
+pub async fn recover_stale_candidates(
+    pool: &PgPool,
+    stale_threshold_minutes: i32,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        WITH stale AS (
+            SELECT id
+            FROM company_candidates
+            WHERE status = 'prequal_queued'
+              AND prequal_started_at IS NOT NULL
+              AND prequal_started_at < NOW() - make_interval(mins => $1)
+              AND prequal_attempts < 4
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE company_candidates cc
+        SET status             = 'new',
+            prequal_last_error = 'stale: reset after timeout',
+            prequal_started_at = NULL
+        FROM stale
+        WHERE cc.id = stale.id
+        "#,
+    )
+    .bind(stale_threshold_minutes)
+    .execute(pool)
+    .await?;
+
+    let recovered = result.rows_affected();
+
+    if recovered > 0 {
+        debug!("Recovered {} stale prequal candidates (threshold={}min)", recovered, stale_threshold_minutes);
+    }
+
+    Ok(recovered)
+}
+
+// ============================================================================
+// Candidate Status Update by Company (for prequal_listener)
+// ============================================================================
+
+/// Update company_candidates.status based on company_id + client_id.
+///
+/// Used by the prequal_listener as a belt-and-suspenders complement to the
+/// DB trigger (trg_sync_candidate_status). If the trigger already ran,
+/// this is a no-op (the WHERE clause won't match any rows).
+pub async fn update_candidate_status_by_company(
+    pool: &PgPool,
+    company_id: Uuid,
+    client_id: Uuid,
+    qualifies: bool,
+    score: Option<f64>,
+) -> Result<u64, sqlx::Error> {
+    let new_status = if qualifies { "qualified" } else { "disqualified" };
+
+    let result = sqlx::query(
+        r#"
+        UPDATE company_candidates
+        SET status              = $3,
+            prequal_completed_at = NOW(),
+            prequal_last_error  = NULL
+        WHERE id = (
+            SELECT id
+            FROM company_candidates
+            WHERE company_id = $1
+              AND client_id  = $2
+              AND status IN ('prequal_queued', 'new')
+            ORDER BY created_at DESC
+            LIMIT 1
+        )
+        "#,
+    )
+    .bind(company_id)
+    .bind(client_id)
+    .bind(new_status)
+    .execute(pool)
+    .await?;
+
+    let affected = result.rows_affected();
+
+    if affected > 0 {
+        debug!(
+            "Updated candidate status for company {} / client {}: {} (score={:.2})",
+            company_id, client_id, new_status, score.unwrap_or(0.0)
+        );
+    }
+
+    Ok(affected)
+}

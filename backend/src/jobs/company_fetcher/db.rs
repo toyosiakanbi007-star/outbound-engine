@@ -281,10 +281,16 @@ pub async fn update_fetch_query(
 // Company Candidates
 // ============================================================================
 
-/// Insert a candidate row linking a company to a fetch run.
+/// Insert a candidate row linking a company to a fetch run + industry.
 ///
-/// Uses ON CONFLICT on the (run_id, company_id) unique index as a safety net
-/// for the same company appearing in overlapping queries within one run.
+/// FIX (migration 0027): Uses ON CONFLICT on (run_id, company_id, industry)
+/// instead of the old (run_id, company_id). This allows the same company to
+/// have separate candidate rows under different industries within one run,
+/// which is essential for accurate industry distribution tracking.
+///
+/// If the same company appears twice for the SAME industry in one run
+/// (e.g., from overlapping query variants), the conflict handler keeps
+/// the existing row unchanged.
 pub async fn insert_candidate(
     pool: &PgPool,
     client_id: Uuid,
@@ -306,7 +312,7 @@ pub async fn insert_candidate(
             client_id, run_id, company_id, industry, variant, source, status, was_duplicate
         )
         VALUES ($1, $2, $3, $4, $5, 'apollo', $6, $7)
-        ON CONFLICT (run_id, company_id) DO UPDATE SET
+        ON CONFLICT (run_id, company_id, industry) DO UPDATE SET
             status = company_candidates.status
         RETURNING id
         "#,
@@ -551,6 +557,166 @@ pub async fn load_company_basic(
     .bind(company_id)
     .fetch_optional(pool)
     .await
+}
+
+// ============================================================================
+// Industry Fetch Cursors (pagination persistence across runs)
+// ============================================================================
+
+/// Row from `industry_fetch_cursors`.
+/// Persists pagination state so subsequent runs resume where the last run
+/// stopped instead of re-fetching from page 1.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FetchCursor {
+    pub id: Uuid,
+    pub client_id: Uuid,
+    pub industry: String,
+    pub variant: String,
+    pub next_page: i32,
+    pub total_fetched: i32,
+    pub total_new: i32,
+    pub exhausted: bool,
+    pub use_loose: bool,
+    pub last_total_hits: Option<i64>,
+    pub last_run_id: Option<Uuid>,
+}
+
+/// Cursor key used for HashMap lookups: "industry::variant"
+pub fn cursor_key(industry: &str, variant: &str) -> String {
+    format!("{}::{}", industry, variant)
+}
+
+/// Load all fetch cursors for a client, keyed by "industry::variant".
+pub async fn load_fetch_cursors(
+    pool: &PgPool,
+    client_id: Uuid,
+) -> Result<std::collections::HashMap<String, FetchCursor>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, FetchCursor>(
+        "SELECT * FROM industry_fetch_cursors WHERE client_id = $1",
+    )
+    .bind(client_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut map = std::collections::HashMap::with_capacity(rows.len());
+    for row in rows {
+        let key = cursor_key(&row.industry, &row.variant);
+        map.insert(key, row);
+    }
+
+    debug!("Loaded {} fetch cursors for client {}", map.len(), client_id);
+    Ok(map)
+}
+
+/// Upsert a fetch cursor after an industry turn completes.
+///
+/// Uses ON CONFLICT on (client_id, industry, variant) to atomically
+/// update if already exists or insert if new.
+pub async fn save_fetch_cursor(
+    pool: &PgPool,
+    client_id: Uuid,
+    industry: &str,
+    variant: &str,
+    next_page: i32,
+    total_fetched_delta: i32,
+    total_new_delta: i32,
+    exhausted: bool,
+    use_loose: bool,
+    last_total_hits: Option<i64>,
+    run_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO industry_fetch_cursors (
+            client_id, industry, variant,
+            next_page, total_fetched, total_new,
+            exhausted, use_loose, last_total_hits, last_run_id,
+            updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+        ON CONFLICT ON CONSTRAINT uq_fetch_cursors_client_industry_variant
+        DO UPDATE SET
+            next_page       = $4,
+            total_fetched   = industry_fetch_cursors.total_fetched + $5,
+            total_new       = industry_fetch_cursors.total_new + $6,
+            exhausted       = $7,
+            use_loose       = $8,
+            last_total_hits = COALESCE($9, industry_fetch_cursors.last_total_hits),
+            last_run_id     = $10,
+            updated_at      = NOW()
+        "#,
+    )
+    .bind(client_id)
+    .bind(industry)
+    .bind(variant)
+    .bind(next_page)
+    .bind(total_fetched_delta)
+    .bind(total_new_delta)
+    .bind(exhausted)
+    .bind(use_loose)
+    .bind(last_total_hits)
+    .bind(run_id)
+    .execute(pool)
+    .await?;
+
+    debug!(
+        "Saved cursor: {}::{} → page={}, exhausted={}, loose={}",
+        industry, variant, next_page, exhausted, use_loose
+    );
+    Ok(())
+}
+
+/// Reset all fetch cursors for a client (for force_full_rescan).
+/// Deletes all cursor rows so the next run starts from page 1 everywhere.
+pub async fn reset_fetch_cursors(
+    pool: &PgPool,
+    client_id: Uuid,
+) -> Result<i64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM industry_fetch_cursors WHERE client_id = $1",
+    )
+    .bind(client_id)
+    .execute(pool)
+    .await?;
+
+    let deleted = result.rows_affected() as i64;
+    debug!("Reset {} fetch cursors for client {}", deleted, client_id);
+    Ok(deleted)
+}
+
+/// Delete cursors for industries that no longer exist in the ICP.
+/// Called at run start to clean up stale cursors from removed industries.
+pub async fn prune_stale_cursors(
+    pool: &PgPool,
+    client_id: Uuid,
+    active_industries: &[String],
+) -> Result<i64, sqlx::Error> {
+    if active_industries.is_empty() {
+        return Ok(0);
+    }
+
+    // Build a WHERE NOT IN clause
+    // sqlx doesn't support array binding easily, so we use ANY($2)
+    let result = sqlx::query(
+        r#"
+        DELETE FROM industry_fetch_cursors
+        WHERE client_id = $1
+          AND industry != ALL($2)
+        "#,
+    )
+    .bind(client_id)
+    .bind(active_industries)
+    .execute(pool)
+    .await?;
+
+    let deleted = result.rows_affected() as i64;
+    if deleted > 0 {
+        debug!(
+            "Pruned {} stale cursors for client {} (active: {:?})",
+            deleted, client_id, active_industries
+        );
+    }
+    Ok(deleted)
 }
 
 // ============================================================================

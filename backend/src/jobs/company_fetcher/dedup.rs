@@ -25,6 +25,11 @@
 //   Phase 1: SELECT to find existing row via cascading key lookup
 //   Phase 2: If found → UPDATE; if not found → INSERT with best ON CONFLICT
 //
+// FIX NOTES (0027):
+//   - BatchDeduper now tracks external_id → company_id mapping
+//   - BatchResult now includes `in_memory_dupe_company_ids` so the orchestrator
+//     can create candidate rows for cross-industry dupes
+//
 // USAGE:
 //   let mut deduper = BatchDeduper::new();
 //   for org in apollo_orgs {
@@ -37,7 +42,7 @@ use sqlx::PgPool;
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::models::{normalize_domain, ApolloOrganization, UpsertResult};
 
@@ -53,6 +58,10 @@ use super::models::{normalize_domain, ApolloOrganization, UpsertResult};
 /// - domains (normalized)
 /// - linkedin_urls (normalized)
 ///
+/// Also maintains external_id → company_id mapping so that when a company
+/// is caught as a dupe, we know which company_id it maps to (needed for
+/// creating cross-industry candidate rows).
+///
 /// Call `is_duplicate()` before processing each org. If it returns true,
 /// skip the org. If false, the org's identity keys are recorded.
 #[derive(Debug)]
@@ -60,6 +69,9 @@ pub struct BatchDeduper {
     external_ids: HashSet<String>,
     domains: HashSet<String>,
     linkedin_urls: HashSet<String>,
+    /// external_id → company_id mapping for dupe lookups.
+    /// Populated when companies are successfully upserted.
+    company_id_map: HashMap<String, Uuid>,
     /// Total duplicates caught in memory (for telemetry).
     pub duplicates_caught: i32,
 }
@@ -70,6 +82,7 @@ impl BatchDeduper {
             external_ids: HashSet::new(),
             domains: HashSet::new(),
             linkedin_urls: HashSet::new(),
+            company_id_map: HashMap::new(),
             duplicates_caught: 0,
         }
     }
@@ -80,6 +93,7 @@ impl BatchDeduper {
             external_ids: HashSet::with_capacity(cap),
             domains: HashSet::with_capacity(cap),
             linkedin_urls: HashSet::with_capacity(cap),
+            company_id_map: HashMap::with_capacity(cap),
             duplicates_caught: 0,
         }
     }
@@ -141,6 +155,20 @@ impl BatchDeduper {
                 self.linkedin_urls.insert(linkedin);
             }
         }
+    }
+
+    /// Record the company_id for a given external_id.
+    /// Called after successful DB upsert so that in-memory dupe lookups
+    /// can resolve the company_id without an extra DB query.
+    pub fn record_company_id(&mut self, external_id: &str, company_id: Uuid) {
+        self.company_id_map.insert(external_id.to_string(), company_id);
+    }
+
+    /// Look up the company_id for a given external_id.
+    /// Returns None if the company hasn't been upserted yet (shouldn't happen
+    /// for in-memory dupes, since the original was processed first).
+    pub fn get_company_id(&self, external_id: &str) -> Option<Uuid> {
+        self.company_id_map.get(external_id).copied()
     }
 
     /// Pre-seed the deduper with domains already known for this client.
@@ -541,6 +569,12 @@ pub struct BatchResult {
     pub in_memory_dupes: i32,
     /// Orgs that had no usable identity (no id, no domain, no name).
     pub skipped_no_identity: i32,
+
+    /// ---- FIX: Company IDs of in-memory dupes ----
+    /// These are companies that were caught by the deduper (already seen
+    /// in an earlier industry's turn) but still need candidate rows
+    /// for cross-industry attribution.
+    pub in_memory_dupe_company_ids: Vec<Uuid>,
 }
 
 impl BatchResult {
@@ -560,6 +594,9 @@ impl BatchResult {
 /// Process a batch of Apollo organizations: dedup in memory, then upsert to DB.
 ///
 /// Returns a BatchResult with counts of inserts, updates, and skips.
+///
+/// FIX (0027): Now also collects company_ids for in-memory dupes so the
+/// orchestrator can create candidate rows for cross-industry attribution.
 pub async fn process_batch(
     pool: &PgPool,
     client_id: Uuid,
@@ -585,11 +622,43 @@ pub async fn process_batch(
         // In-memory dedup
         if deduper.is_duplicate(org) {
             result.in_memory_dupes += 1;
+
+            // ---- FIX: Collect company_id for cross-industry candidate rows ----
+            // The deduper knows this org was already processed. Look up its
+            // company_id so the orchestrator can insert a candidate row for
+            // this industry too.
+            if let Some(company_id) = deduper.get_company_id(&org.id) {
+                result.in_memory_dupe_company_ids.push(company_id);
+            } else {
+                // Fallback: org was from a previous run (seeded into deduper but
+                // no company_id recorded). Do a lightweight DB lookup.
+                match find_existing_company(pool, client_id, org).await {
+                    Ok(Some(company_id)) => {
+                        deduper.record_company_id(&org.id, company_id);
+                        result.in_memory_dupe_company_ids.push(company_id);
+                    }
+                    Ok(None) => {
+                        trace!(
+                            "In-memory dupe {} has no DB match (stale deduper entry?)",
+                            org.id
+                        );
+                    }
+                    Err(e) => {
+                        trace!(
+                            "Failed to look up company_id for dupe {}: {}",
+                            org.id, e
+                        );
+                    }
+                }
+            }
             continue;
         }
 
         // DB upsert
         let upsert = upsert_company(pool, client_id, org).await?;
+
+        // ---- FIX: Record company_id in deduper for future cross-industry lookups ----
+        deduper.record_company_id(&org.id, upsert.company_id);
 
         if upsert.was_insert {
             result.inserted.push(upsert);
@@ -599,11 +668,12 @@ pub async fn process_batch(
     }
 
     debug!(
-        "Batch processed: {} orgs → {} new, {} existing, {} in-mem dupes, {} skipped",
+        "Batch processed: {} orgs → {} new, {} existing, {} in-mem dupes ({} with company_id), {} skipped",
         orgs.len(),
         result.inserted.len(),
         result.updated.len(),
         result.in_memory_dupes,
+        result.in_memory_dupe_company_ids.len(),
         result.skipped_no_identity,
     );
 
@@ -617,7 +687,6 @@ pub async fn process_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     /// Helper to build a minimal ApolloOrganization for testing.
     fn make_org(id: &str, domain: Option<&str>, linkedin: Option<&str>) -> ApolloOrganization {
@@ -757,6 +826,37 @@ mod tests {
         assert!(!deduper.is_duplicate(&org2));
     }
 
+    // ---- Company ID Map Tests ----
+
+    #[test]
+    fn test_record_and_get_company_id() {
+        let mut deduper = BatchDeduper::new();
+        let company_id = Uuid::new_v4();
+
+        deduper.record_company_id("ext_123", company_id);
+        assert_eq!(deduper.get_company_id("ext_123"), Some(company_id));
+        assert_eq!(deduper.get_company_id("ext_999"), None);
+    }
+
+    #[test]
+    fn test_company_id_survives_dupe_check() {
+        let mut deduper = BatchDeduper::new();
+        let org1 = make_org("abc123", Some("acme.com"), None);
+
+        assert!(!deduper.is_duplicate(&org1));
+
+        // Record company_id after upsert
+        let company_id = Uuid::new_v4();
+        deduper.record_company_id("abc123", company_id);
+
+        // Dupe check
+        let org2 = make_org("abc123", Some("different.com"), None);
+        assert!(deduper.is_duplicate(&org2));
+
+        // Can still look up company_id
+        assert_eq!(deduper.get_company_id("abc123"), Some(company_id));
+    }
+
     // ---- BatchResult Tests ----
 
     #[test]
@@ -775,9 +875,11 @@ mod tests {
             was_insert: false,
         });
         result.in_memory_dupes = 3;
+        result.in_memory_dupe_company_ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
 
         assert_eq!(result.total_processed(), 3);
         assert_eq!(result.new_count(), 2);
         assert_eq!(result.dupe_count(), 4); // 1 updated + 3 in-mem
+        assert_eq!(result.in_memory_dupe_company_ids.len(), 3);
     }
 }

@@ -12,9 +12,32 @@
 //   3. Load client_context (from client_configs + ICP)
 //   4. Build Azure Function request: { mode: "prequal", client_id, company_id, company_name, domain, client_context }
 //   5. POST to Azure Function
-//   6. Parse response for qualifies/score
+//   6. Parse response — extract qualifies/score from nested `prequal` object
 //   7. Update candidate status → qualified/disqualified
 //   8. On failure: increment attempts, store error, continue with next company
+//
+// RESPONSE STRUCTURE (from Azure Function):
+//   The Azure Function returns a nested JSON:
+//   {
+//     "prequal": {
+//       "qualifies": bool,
+//       "score": float,
+//       "staleness_adjusted_score": float,
+//       "gates_passed": [...],
+//       "gates_failed": [...],
+//       ...
+//     },
+//     "company_snapshot": { ... },
+//     "offer_fit": { "icp_fit": "qualify", "tags": [...], ... },
+//     "pain_hypotheses": [ ... ],
+//     "_prequal_reasons": { "summary": "...", "tags": [...], ... },  // if LLM enabled
+//     "_meta": { ... }
+//   }
+//
+//   `qualifies` and `score` live inside the `prequal` sub-object — NOT at top level.
+//   The Azure Function's progressive_writer already writes the full prequal result
+//   (including _prequal_reasons, offer_fit_tags, full_result) to the company_prequal
+//   table. This Rust handler only needs to update company_candidates status.
 //
 // SAFETY:
 //   - Each company is processed independently — one failure doesn't stop the batch.
@@ -230,25 +253,56 @@ async fn process_single_candidate(
 
     match call_result {
         Ok(response) => {
-            // 4. Extract qualifies/score from response
-            let qualifies = response
-                .get("qualifies")
+            // 4. Extract qualifies/score from nested prequal object.
+            //
+            //    Azure Function returns:
+            //    {
+            //      "prequal": {
+            //        "qualifies": bool,
+            //        "score": float,
+            //        "staleness_adjusted_score": float,
+            //        "final_score": float,
+            //        ...
+            //      },
+            //      ...
+            //    }
+            //
+            //    The progressive_writer inside the Azure Function has already
+            //    written the full result (including _prequal_reasons and
+            //    offer_fit_tags) to the company_prequal table. We only need
+            //    to extract qualifies/score for the candidate status update.
+
+            let prequal_obj = response.get("prequal");
+
+            let qualifies = prequal_obj
+                .and_then(|p| p.get("qualifies"))
                 .and_then(|v| v.as_bool())
+                // Fallback: check top-level (backward compat with older AF versions)
+                .or_else(|| response.get("qualifies").and_then(|v| v.as_bool()))
                 .unwrap_or(false);
-            let score = response
-                .get("score")
-                .and_then(|v| v.as_f64());
+
+            let score = prequal_obj
+                .and_then(|p| p.get("staleness_adjusted_score"))
+                .and_then(|v| v.as_f64())
+                // Fallback: try final_score, then score at prequal level
+                .or_else(|| prequal_obj.and_then(|p| p.get("final_score")).and_then(|v| v.as_f64()))
+                .or_else(|| prequal_obj.and_then(|p| p.get("score")).and_then(|v| v.as_f64()))
+                // Fallback: top-level score (backward compat)
+                .or_else(|| response.get("score").and_then(|v| v.as_f64()));
+
+            let has_reasons = response.get("_prequal_reasons").is_some();
 
             info!(
-                "Worker {}: prequal complete for {} ({}) — qualifies={}, score={:.2}",
+                "Worker {}: prequal complete for {} ({}) — qualifies={}, score={:.3}, has_reasons={}",
                 worker_id,
                 candidate.company_name,
                 company_id,
                 qualifies,
-                score.unwrap_or(0.0)
+                score.unwrap_or(0.0),
+                has_reasons,
             );
 
-            // 5. Update candidate status
+            // 5. Update candidate status (qualified/disqualified)
             if let Err(e) = db::update_candidate_success(pool, cid, qualifies, None).await {
                 error!(
                     "Worker {}: failed to update candidate {} after success: {}",
@@ -418,5 +472,101 @@ mod tests {
     fn test_truncate() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 5), "hello...");
+    }
+
+    /// Verify we correctly extract qualifies/score from the nested prequal object
+    /// (the actual Azure Function response structure).
+    #[test]
+    fn test_extract_qualifies_from_nested_prequal() {
+        let response = json!({
+            "company_id": "abc-123",
+            "prequal": {
+                "qualifies": false,
+                "score": 0.383,
+                "final_score": 0.383,
+                "raw_score": 1.0,
+                "staleness_adjusted_score": 0.383,
+                "gates_passed": ["evidence", "sources", "why_now"],
+                "gates_failed": ["score<0.5", "recency"],
+            },
+            "offer_fit": {
+                "icp_fit": "qualify",
+                "tags": ["icp_match", "industry_fit"],
+            },
+            "_prequal_reasons": {
+                "qualifies": false,
+                "summary": "Disqualified due to stale evidence.",
+                "reasons": ["Score below threshold"],
+                "tags": ["recency", "low_score"],
+                "confidence": 0.9,
+            },
+        });
+
+        let prequal_obj = response.get("prequal");
+
+        // qualifies from prequal sub-object
+        let qualifies = prequal_obj
+            .and_then(|p| p.get("qualifies"))
+            .and_then(|v| v.as_bool())
+            .or_else(|| response.get("qualifies").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        assert_eq!(qualifies, false);
+
+        // score from staleness_adjusted_score
+        let score = prequal_obj
+            .and_then(|p| p.get("staleness_adjusted_score"))
+            .and_then(|v| v.as_f64())
+            .or_else(|| prequal_obj.and_then(|p| p.get("final_score")).and_then(|v| v.as_f64()))
+            .or_else(|| prequal_obj.and_then(|p| p.get("score")).and_then(|v| v.as_f64()))
+            .or_else(|| response.get("score").and_then(|v| v.as_f64()));
+        assert!((score.unwrap() - 0.383).abs() < 0.001);
+
+        // has_reasons
+        assert!(response.get("_prequal_reasons").is_some());
+    }
+
+    /// Verify backward compat: top-level qualifies/score still works for older AF versions.
+    #[test]
+    fn test_extract_qualifies_backward_compat() {
+        let response = json!({
+            "qualifies": true,
+            "score": 0.75,
+        });
+
+        let prequal_obj = response.get("prequal"); // None
+
+        let qualifies = prequal_obj
+            .and_then(|p| p.get("qualifies"))
+            .and_then(|v| v.as_bool())
+            .or_else(|| response.get("qualifies").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        assert_eq!(qualifies, true);
+
+        let score = prequal_obj
+            .and_then(|p| p.get("staleness_adjusted_score"))
+            .and_then(|v| v.as_f64())
+            .or_else(|| prequal_obj.and_then(|p| p.get("final_score")).and_then(|v| v.as_f64()))
+            .or_else(|| prequal_obj.and_then(|p| p.get("score")).and_then(|v| v.as_f64()))
+            .or_else(|| response.get("score").and_then(|v| v.as_f64()));
+        assert!((score.unwrap() - 0.75).abs() < 0.001);
+    }
+
+    /// Edge case: prequal object exists but qualifies is missing → default false.
+    #[test]
+    fn test_extract_qualifies_missing_field() {
+        let response = json!({
+            "prequal": {
+                "score": 0.6,
+            },
+        });
+
+        let prequal_obj = response.get("prequal");
+
+        let qualifies = prequal_obj
+            .and_then(|p| p.get("qualifies"))
+            .and_then(|v| v.as_bool())
+            .or_else(|| response.get("qualifies").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        assert_eq!(qualifies, false);
     }
 }

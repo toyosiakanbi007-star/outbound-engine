@@ -51,6 +51,22 @@ pub async fn handle_prequal_dispatch(
         worker_id, client_id, payload.source, payload.force
     );
 
+    // Step 0: Recover stale candidates stuck in prequal_queued from previous timeouts.
+    // This ensures candidates that were dispatched but never received a result
+    // (Azure Function crash, network issue) get retried.
+    match db::recover_stale_candidates(pool, 30).await {
+        Ok(recovered) if recovered > 0 => {
+            info!(
+                "Worker {}: recovered {} stale candidates before dispatch",
+                worker_id, recovered
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!("Worker {}: stale recovery failed (non-fatal): {}", worker_id, e);
+        }
+    }
+
     // 1. Load config
     let config = db::load_prequal_config(pool, client_id).await?;
     let batch_size = config.effective_batch_size(payload.batch_size);
