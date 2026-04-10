@@ -1,0 +1,58 @@
+[package]
+name = "backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum  = { version = "0.7", features = ["macros", "json"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+sqlx = { version = "0.7", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "chrono",
+    "macros",
+    "uuid",
+    "json"
+] }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "registry"] }
+
+uuid = { version = "1", features = ["v4", "serde"] }
+
+dotenvy = "0.15"
+
+home = "=0.5.11"
+
+chrono = { version = "0.4", features = ["serde", "clock"] }
+
+anyhow = "1.0"
+async-trait = "0.1"
+
+# HTTP client used for:
+# - calling external APIs (Apollo later)
+# - calling Azure HTTP Functions / generic HTTP news service
+reqwest = { version = "0.12", features = [
+    "json",
+    "gzip",
+    "brotli",
+    "deflate",
+    "rustls-tls"
+] }
+
+# Error type for NewsSourcingClient, etc.
+thiserror = "1.0"
+
+# AWS path for news service:
+# - used only when NEWS_LAMBDA_FUNCTION_NAME is set and cloud_provider="aws"
+# - safe to keep even if you run only on Azure (just not used at runtime)
+aws-config = "1"
+aws-sdk-lambda = "1"
+lazy_static = "1.4"
+
+# Control panel: CORS support for frontend dev (localhost:3001 → localhost:3000)
+tower-http = { version = "0.5", features = ["cors"] }
