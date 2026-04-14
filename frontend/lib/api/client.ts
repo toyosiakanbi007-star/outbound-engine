@@ -317,6 +317,20 @@ export function useWorkers() {
   });
 }
 
+export function useCancelJobs() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { job_ids?: string[]; job_type?: string; client_id?: string; statuses?: string[] }) =>
+      apiFetch('/queue-status/cancel', { method: 'POST', body: JSON.stringify(body) }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['queue-status'] });
+      qc.invalidateQueries({ queryKey: ['queue-jobs'] });
+      qc.invalidateQueries({ queryKey: ['prequal-runs'] });
+      qc.invalidateQueries({ queryKey: ['discovery-runs'] });
+    },
+  });
+}
+
 // ============================================================================
 // Logs
 // ============================================================================
@@ -326,3 +340,200 @@ export function useLogs(filters: Record<string, unknown> = {}) {
     queryFn: () => apiFetch<ApiResponse<LogEntry[]>>(`/logs?${toParams(filters)}`),
   });
 }
+
+// ============================================================================
+// Onboarding
+// ============================================================================
+
+export function useOnboardingRuns(filters: { client_id?: string; status?: string } = {}) {
+  return useQuery({
+    queryKey: ['onboarding-runs', filters],
+    queryFn: () => apiFetch<ApiResponse<any[]>>(`/onboarding-runs?${toParams(filters)}`),
+    refetchInterval: 5_000,
+  });
+}
+
+export function useOnboardingRun(id: string) {
+  return useQuery({
+    queryKey: ['onboarding-run', id],
+    queryFn: () => apiFetch<{ data: { run: any; artifact_counts: Record<string, number> } }>(`/onboarding-runs/${id}`),
+    refetchInterval: 3_000,
+  });
+}
+
+export function useOnboardingArtifacts(id: string, type?: string) {
+  return useQuery({
+    queryKey: ['onboarding-artifacts', id, type],
+    queryFn: () => apiFetch<ApiResponse<any[]>>(`/onboarding-runs/${id}/artifacts${type ? `?artifact_type=${type}` : ''}`),
+    enabled: !!id,
+  });
+}
+
+export function useStartOnboarding(clientId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { client_name: string; client_domain: string; operator_note?: string }) =>
+      apiFetch(`/clients/${clientId}/onboarding-runs`, { method: 'POST', body: JSON.stringify(body) }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['onboarding-runs'] });
+    },
+  });
+}
+
+export function useActivateOnboarding(runId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: {
+      edited_config?: any;
+      edited_prequal_config?: any;
+      edited_icp?: any;
+      run_discovery?: boolean;
+      discovery_batch_target?: number;
+    }) => apiFetch(`/onboarding-runs/${runId}/activate`, { method: 'POST', body: JSON.stringify(body) }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['onboarding-run', runId] });
+      qc.invalidateQueries({ queryKey: ['clients'] });
+    },
+  });
+}
+
+export function useRegenerateOnboarding(runId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => apiFetch(`/onboarding-runs/${runId}/regenerate`, { method: 'POST' }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['onboarding-run', runId] });
+    },
+  });
+}
+
+// ============================================================================
+// Delete Client
+// ============================================================================
+
+export function useDeleteClient() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (clientId: string) =>
+      apiFetch(`/clients/${clientId}`, { method: 'DELETE' }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['clients'] });
+    },
+  });
+}
+
+// ============================================================================
+// Flush Companies
+// ============================================================================
+
+export function useFlushCompanies() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { clientId: string; reset_cursors?: boolean; cancel_jobs?: boolean }) =>
+      apiFetch(`/clients/${body.clientId}/flush-companies`, {
+        method: 'POST',
+        body: JSON.stringify({ reset_cursors: body.reset_cursors ?? true, cancel_jobs: body.cancel_jobs ?? true }),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['companies'] });
+      qc.invalidateQueries({ queryKey: ['clients'] });
+      qc.invalidateQueries({ queryKey: ['queue-status'] });
+      qc.invalidateQueries({ queryKey: ['discovery-runs'] });
+    },
+  });
+}
+
+// ============================================================================
+// Retry Failed Jobs
+// ============================================================================
+
+export function useRetryJobs() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { job_ids?: string[]; job_type?: string; client_id?: string }) =>
+      apiFetch('/queue-status/retry', { method: 'POST', body: JSON.stringify(body) }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['queue-status'] });
+      qc.invalidateQueries({ queryKey: ['queue-jobs'] });
+      qc.invalidateQueries({ queryKey: ['companies'] });
+    },
+  });
+}
+
+// ============================================================================
+// Bulk Prequal
+// ============================================================================
+
+export function useBulkPrequal() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { company_ids: string[]; force?: boolean; batch_size?: number }) =>
+      apiFetch('/companies/bulk-prequal', { method: 'POST', body: JSON.stringify(body) }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['companies'] });
+      qc.invalidateQueries({ queryKey: ['queue-status'] });
+      qc.invalidateQueries({ queryKey: ['queue-jobs'] });
+    },
+  });
+}
+
+// ============================================================================
+// Bulk Aggregate
+// ============================================================================
+
+export function useBulkAggregate() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { company_ids: string[]; batch_size?: number }) =>
+      apiFetch('/companies/bulk-aggregate', { method: 'POST', body: JSON.stringify(body) }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['companies'] });
+      qc.invalidateQueries({ queryKey: ['queue-status'] });
+      qc.invalidateQueries({ queryKey: ['queue-jobs'] });
+    },
+  });
+}
+
+// ============================================================================
+// Single Company Aggregate
+// ============================================================================
+
+export function useAggregateCompany(companyId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => apiFetch(`/companies/${companyId}/actions/aggregate`, { method: 'POST' }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['company-detail', companyId] });
+      qc.invalidateQueries({ queryKey: ['queue-status'] });
+    },
+  });
+}
+
+// ============================================================================
+// Manual Client Setup
+// ============================================================================
+
+export function useManualSetup(clientId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { config: any; icp?: any; prequal_config?: any; activate?: boolean }) =>
+      apiFetch(`/clients/${clientId}/manual-setup`, { method: 'POST', body: JSON.stringify(body) }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['clients'] });
+      qc.invalidateQueries({ queryKey: ['client', clientId] });
+    },
+  });
+}
+
+// ============================================================================
+// Company Aggregate Result
+// ============================================================================
+
+export function useCompanyAggregate(id: string, enabled = true) {
+  return useQuery({
+    queryKey: ['company-aggregate', id],
+    queryFn: () => apiFetch<{ data: any }>(`/companies/${id}/aggregate`),
+    enabled: !!id && enabled,
+  });
+}
+

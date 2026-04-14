@@ -421,28 +421,77 @@ pub async fn rerun_prequal(
     .map_err(|e| { error!("Failed to find company: {:?}", e); db_error("DB error") })?
     .ok_or_else(|| not_found("Company not found"))?;
 
-    // Reset latest candidate to 'new' so dispatch picks it up
-    let affected = sqlx::query(
-        r#"UPDATE company_candidates
-           SET status = 'new', prequal_started_at = NULL, prequal_last_error = NULL
-           WHERE id = (
-               SELECT id FROM company_candidates
-               WHERE company_id = $1 AND client_id = $2
-                 AND status IN ('qualified', 'disqualified', 'prequal_queued')
-               ORDER BY created_at DESC LIMIT 1
-           )"#,
+    // Find the latest candidate for this company
+    let candidate_id = sqlx::query_scalar::<_, Uuid>(
+        r#"SELECT id FROM company_candidates
+           WHERE company_id = $1 AND client_id = $2
+           ORDER BY created_at DESC LIMIT 1"#,
     )
     .bind(company_id)
     .bind(client_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| { error!("Failed to find candidate: {:?}", e); db_error("DB error") })?
+    .ok_or_else(|| not_found("No candidate found for this company"))?;
+
+    // Reset candidate to prequal_queued (ready for batch processing)
+    sqlx::query(
+        r#"UPDATE company_candidates
+           SET status = 'prequal_queued',
+               prequal_started_at = NULL,
+               prequal_last_error = NULL
+           WHERE id = $1"#,
+    )
+    .bind(candidate_id)
     .execute(&state.db)
     .await
     .map_err(|e| { error!("Failed to reset candidate: {:?}", e); db_error("Failed to reset") })?;
 
-    info!("Reset prequal for company {} ({} rows)", company_id, affected.rows_affected());
+    // Delete old prequal results so they get regenerated
+    let _ = sqlx::query("DELETE FROM company_prequal WHERE company_id = $1")
+        .bind(company_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM v3_hypotheses WHERE company_id = $1")
+        .bind(company_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM v3_evidence WHERE company_id = $1")
+        .bind(company_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM company_news WHERE company_id = $1")
+        .bind(company_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM discovered_urls WHERE company_id = $1")
+        .bind(company_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM offer_fit_decisions WHERE company_id = $1")
+        .bind(company_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM company_snapshots WHERE company_id = $1")
+        .bind(company_id).execute(&state.db).await;
+
+    // Enqueue a prequal_batch job directly (don't wait for dispatch)
+    let batch_id = Uuid::new_v4();
+    let payload = json!({
+        "client_id": client_id,
+        "batch_id": batch_id,
+        "candidate_ids": [candidate_id],
+        "force": true,
+    });
+
+    let job_id = sqlx::query_scalar::<_, Uuid>(
+        r#"INSERT INTO jobs (client_id, job_type, payload, status, run_at)
+           VALUES ($1, 'prequal_batch', $2, 'pending', NOW())
+           RETURNING id"#,
+    )
+    .bind(client_id)
+    .bind(&payload)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| { error!("Failed to enqueue: {:?}", e); db_error("Failed to enqueue") })?;
+
+    info!("Rerun prequal for company {} → job {}, candidate {}", company_id, job_id, candidate_id);
 
     Ok((StatusCode::ACCEPTED, Json(json!({
-        "data": { "company_id": company_id, "rows_affected": affected.rows_affected(),
-                  "message": "Candidate reset — will be picked up by next prequal dispatch" }
+        "data": {
+            "company_id": company_id,
+            "candidate_id": candidate_id,
+            "job_id": job_id,
+            "message": "Prequal job enqueued — will process immediately"
+        }
     }))))
 }
 
@@ -546,4 +595,37 @@ fn db_error(msg: &str) -> (StatusCode, Json<JsonValue>) {
 
 fn not_found(msg: &str) -> (StatusCode, Json<JsonValue>) {
     (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "not_found", "message": msg } })))
+}
+
+/// GET /api/companies/:id/aggregate — latest aggregate result
+pub async fn aggregate(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<JsonValue>, (StatusCode, Json<JsonValue>)> {
+    let result: Option<JsonValue> = sqlx::query_scalar(
+        r#"SELECT row_to_json(t) FROM (
+            SELECT
+                final_score, tier, qualifies, do_not_outreach, needs_review,
+                score_breakdown, unified_hypotheses, tech_fit AS tech_context,
+                offer_fit AS final_offer_fit,
+                recommended_personas, title_keywords, title_exact,
+                decision_notes, llm_calls, duration_ms,
+                created_at, updated_at
+            FROM aggregate_results
+            WHERE company_id = $1
+            ORDER BY created_at DESC LIMIT 1
+        ) t"#,
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        error!("Failed to fetch aggregate: {:?}", e);
+        db_error("Failed to fetch aggregate result")
+    })?;
+
+    match result {
+        Some(data) => Ok(Json(json!({ "data": data }))),
+        None => Ok(Json(json!({ "data": null }))),
+    }
 }

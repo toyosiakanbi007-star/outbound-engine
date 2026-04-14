@@ -47,7 +47,7 @@ pub async fn run_server(
         )
         .route(
             "/api/clients/:id",
-            get(routes::clients::get).put(routes::clients::update),
+            get(routes::clients::get).put(routes::clients::update).delete(routes::clients::delete),
         )
         .route(
             "/api/clients/:id/config",
@@ -96,6 +96,10 @@ pub async fn run_server(
             get(routes::companies::candidates),
         )
         .route(
+            "/api/companies/:id/aggregate",
+            get(routes::companies::aggregate),
+        )
+        .route(
             "/api/companies/:id/actions/rerun-prequal",
             post(routes::companies::rerun_prequal),
         )
@@ -124,11 +128,54 @@ pub async fn run_server(
             post(routes::pipeline::run),
         )
         // ============================================================
+        // Client Onboarding AI
+        // ============================================================
+        .route(
+            "/api/clients/:id/onboarding-runs",
+            post(routes::onboarding::create),
+        )
+        .route("/api/onboarding-runs", get(routes::onboarding::list))
+        .route("/api/onboarding-runs/:id", get(routes::onboarding::get))
+        .route(
+            "/api/onboarding-runs/:id/artifacts",
+            get(routes::onboarding::artifacts),
+        )
+        .route(
+            "/api/onboarding-runs/:id/activate",
+            post(routes::onboarding::activate),
+        )
+        .route(
+            "/api/onboarding-runs/:id/regenerate",
+            post(routes::onboarding::regenerate),
+        )
+        // ============================================================
         // Queue & Workers
         // ============================================================
         .route("/api/queue-status", get(routes::queue::status))
         .route("/api/queue-status/jobs", get(routes::queue::jobs))
+        .route("/api/queue-status/cancel", post(routes::queue::cancel))
+        .route("/api/queue-status/retry", post(routes::manage::retry_jobs))
         .route("/api/workers", get(routes::queue::workers))
+        // ============================================================
+        // Client Management
+        // ============================================================
+        .route(
+            "/api/clients/:id/flush-companies",
+            post(routes::manage::flush_companies),
+        )
+        .route(
+            "/api/clients/:id/manual-setup",
+            post(routes::manage::manual_setup),
+        )
+        // ============================================================
+        // Bulk Company Actions
+        // ============================================================
+        .route("/api/companies/bulk-prequal", post(routes::manage::bulk_prequal))
+        .route("/api/companies/bulk-aggregate", post(routes::manage::bulk_aggregate))
+        .route(
+            "/api/companies/:id/actions/aggregate",
+            post(routes::manage::aggregate_company),
+        )
         // ============================================================
         // Structured Logs
         // ============================================================

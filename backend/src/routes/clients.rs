@@ -557,3 +557,64 @@ fn not_found(msg: &str) -> (StatusCode, Json<JsonValue>) {
         })),
     )
 }
+
+/// DELETE /api/clients/:id — delete client and all associated data
+pub async fn delete(
+    State(state): State<AppState>,
+    Path(client_id): Path<Uuid>,
+) -> Result<Json<JsonValue>, (StatusCode, Json<JsonValue>)> {
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM clients WHERE id = $1)")
+        .bind(client_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| { tracing::error!("DB error: {:?}", e); db_error("DB error") })?;
+
+    if !exists {
+        return Err(not_found("Client not found"));
+    }
+
+    // Cancel all pending/running jobs first
+    let jobs_cancelled = sqlx::query(
+        "UPDATE jobs SET status='failed', last_error='client deleted', completed_at=NOW() WHERE client_id=$1 AND status IN ('pending','running')"
+    ).bind(client_id).execute(&state.db).await.map(|r| r.rows_affected()).unwrap_or(0);
+
+    // Delete all company data (derived tables first)
+    let _ = sqlx::query("DELETE FROM company_prequal WHERE company_id IN (SELECT id FROM companies WHERE client_id=$1)")
+        .bind(client_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM v3_hypotheses WHERE company_id IN (SELECT id FROM companies WHERE client_id=$1)")
+        .bind(client_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM v3_evidence WHERE company_id IN (SELECT id FROM companies WHERE client_id=$1)")
+        .bind(client_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM company_news WHERE company_id IN (SELECT id FROM companies WHERE client_id=$1)")
+        .bind(client_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM discovered_urls WHERE company_id IN (SELECT id FROM companies WHERE client_id=$1)")
+        .bind(client_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM offer_fit_decisions WHERE company_id IN (SELECT id FROM companies WHERE client_id=$1)")
+        .bind(client_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM company_snapshots WHERE company_id IN (SELECT id FROM companies WHERE client_id=$1)")
+        .bind(client_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM aggregate_results WHERE company_id IN (SELECT id FROM companies WHERE client_id=$1)")
+        .bind(client_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM company_candidates WHERE client_id=$1")
+        .bind(client_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM companies WHERE client_id=$1")
+        .bind(client_id).execute(&state.db).await;
+
+    // Delete fetch runs, onboarding, configs, ICP, jobs
+    let _ = sqlx::query("DELETE FROM company_fetch_runs WHERE client_id=$1").bind(client_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM client_onboarding_artifacts WHERE run_id IN (SELECT id FROM client_onboarding_runs WHERE client_id=$1)")
+        .bind(client_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM client_onboarding_runs WHERE client_id=$1").bind(client_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM client_configs WHERE client_id=$1").bind(client_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM client_icp_profiles WHERE client_id=$1").bind(client_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM jobs WHERE client_id=$1").bind(client_id).execute(&state.db).await;
+
+    // Finally delete the client
+    sqlx::query("DELETE FROM clients WHERE id=$1")
+        .bind(client_id).execute(&state.db).await
+        .map_err(|e| { tracing::error!("Failed to delete client: {:?}", e); db_error("Failed to delete") })?;
+
+    tracing::info!("Deleted client {} and all associated data ({} jobs cancelled)", client_id, jobs_cancelled);
+
+    Ok(Json(serde_json::json!({ "data": { "deleted": true, "client_id": client_id } })))
+}

@@ -24,6 +24,15 @@ use crate::jobs::company_fetcher::{
     DiscoverCompaniesPayload, run_company_fetcher,
 };
 
+// V5: Import Client Onboarding AI handlers
+use crate::jobs::onboarding;
+
+// V5: Import phase_b aggregate functions
+use crate::jobs::phase_b_controller::{
+    trigger_aggregate, store_aggregate_result, update_analysis_run_aggregate_status,
+    AggregateRequest,
+};
+
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use sqlx::{self, Error};
@@ -486,6 +495,261 @@ pub async fn process_job(
                         worker_id, payload.client_id, e
                     );
                     mark_job_failed(pool, job.id, worker_id, &format!("{:?}", e)).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // =====================================================
+        // V5: Client Onboarding AI
+        // =====================================================
+
+        JobType::StartClientOnboarding => {
+            info!("Worker {} handling job {} of type START_CLIENT_ONBOARDING", worker_id, job.id);
+            let payload: onboarding::models::StartOnboardingPayload = match serde_json::from_value(job.payload.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Worker {}: invalid START_CLIENT_ONBOARDING payload for job {}: {}", worker_id, job.id, e);
+                    mark_job_failed(pool, job.id, worker_id, &format!("invalid payload: {}", e)).await?;
+                    return Ok(());
+                }
+            };
+            if let Err(e) = onboarding::run_start_onboarding(pool, http_client.as_ref(), payload, worker_id).await {
+                error!("Worker {}: START_CLIENT_ONBOARDING failed: {:?}", worker_id, e);
+                // Mark the onboarding run as failed too
+                let _ = sqlx::query("UPDATE client_onboarding_runs SET status='failed', error=$1, updated_at=NOW() WHERE id=$2")
+                    .bind(format!("{:?}", e))
+                    .bind(job.payload.get("run_id").and_then(|v| v.as_str()).unwrap_or(""))
+                    .execute(pool)
+                    .await;
+                mark_job_failed(pool, job.id, worker_id, &format!("{:?}", e)).await?;
+                return Ok(());
+            }
+        }
+
+        JobType::OnboardingEnrichAndCrawl => {
+            info!("Worker {} handling job {} of type ONBOARDING_ENRICH_AND_CRAWL", worker_id, job.id);
+            let payload: onboarding::models::EnrichAndCrawlPayload = match serde_json::from_value(job.payload.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Worker {}: invalid payload for job {}: {}", worker_id, job.id, e);
+                    mark_job_failed(pool, job.id, worker_id, &format!("invalid payload: {}", e)).await?;
+                    return Ok(());
+                }
+            };
+            let run_id = payload.run_id;
+            if let Err(e) = onboarding::run_enrich_and_crawl(pool, http_client.as_ref(), payload, worker_id).await {
+                error!("Worker {}: ONBOARDING_ENRICH_AND_CRAWL failed: {:?}", worker_id, e);
+                let _ = sqlx::query("UPDATE client_onboarding_runs SET status='failed', error=$1, updated_at=NOW() WHERE id=$2")
+                    .bind(format!("{:?}", e))
+                    .bind(run_id)
+                    .execute(pool)
+                    .await;
+                mark_job_failed(pool, job.id, worker_id, &format!("{:?}", e)).await?;
+                return Ok(());
+            }
+        }
+
+        JobType::OnboardingGenerateDrafts => {
+            info!("Worker {} handling job {} of type ONBOARDING_GENERATE_DRAFTS", worker_id, job.id);
+            let payload: onboarding::models::GenerateDraftsPayload = match serde_json::from_value(job.payload.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Worker {}: invalid payload for job {}: {}", worker_id, job.id, e);
+                    mark_job_failed(pool, job.id, worker_id, &format!("invalid payload: {}", e)).await?;
+                    return Ok(());
+                }
+            };
+            let run_id = payload.run_id;
+            if let Err(e) = onboarding::run_generate_drafts(pool, http_client.as_ref(), payload, worker_id).await {
+                error!("Worker {}: ONBOARDING_GENERATE_DRAFTS failed: {:?}", worker_id, e);
+                let _ = sqlx::query("UPDATE client_onboarding_runs SET status='failed', error=$1, updated_at=NOW() WHERE id=$2")
+                    .bind(format!("{:?}", e))
+                    .bind(run_id)
+                    .execute(pool)
+                    .await;
+                mark_job_failed(pool, job.id, worker_id, &format!("{:?}", e)).await?;
+                return Ok(());
+            }
+        }
+
+        JobType::OnboardingFinalizeDraft => {
+            info!("Worker {} handling job {} of type ONBOARDING_FINALIZE_DRAFT", worker_id, job.id);
+            let payload: onboarding::models::FinalizeDraftPayload = match serde_json::from_value(job.payload.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Worker {}: invalid payload for job {}: {}", worker_id, job.id, e);
+                    mark_job_failed(pool, job.id, worker_id, &format!("invalid payload: {}", e)).await?;
+                    return Ok(());
+                }
+            };
+            let run_id = payload.run_id;
+            if let Err(e) = onboarding::run_finalize_draft(pool, http_client.as_ref(), payload, worker_id).await {
+                error!("Worker {}: ONBOARDING_FINALIZE_DRAFT failed: {:?}", worker_id, e);
+                let _ = sqlx::query("UPDATE client_onboarding_runs SET status='failed', error=$1, updated_at=NOW() WHERE id=$2")
+                    .bind(format!("{:?}", e))
+                    .bind(run_id)
+                    .execute(pool)
+                    .await;
+                mark_job_failed(pool, job.id, worker_id, &format!("{:?}", e)).await?;
+                return Ok(());
+            }
+        }
+
+        // =====================================================
+        // V5: Aggregator — standalone aggregate trigger
+        // =====================================================
+
+        JobType::RunAggregate => {
+            info!("Worker {} handling job {} of type RUN_AGGREGATE", worker_id, job.id);
+
+            let company_id = job.payload.get("company_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .ok_or_else(|| Error::Protocol("missing company_id in run_aggregate payload".into()))?;
+            let client_id = job.payload.get("client_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .ok_or_else(|| Error::Protocol("missing client_id in run_aggregate payload".into()))?;
+            let run_id = job.payload.get("run_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .ok_or_else(|| Error::Protocol("missing run_id in run_aggregate payload".into()))?;
+
+            // Load company info
+            let company = sqlx::query_as::<_, (String, String)>(
+                "SELECT name, COALESCE(domain, '') FROM companies WHERE id = $1"
+            ).bind(company_id).fetch_optional(pool).await?;
+
+            let (company_name, domain) = match company {
+                Some(c) => c,
+                None => {
+                    warn!("Worker {}: company {} not found for aggregate", worker_id, company_id);
+                    mark_job_failed(pool, job.id, worker_id, "company not found").await?;
+                    return Ok(());
+                }
+            };
+
+            // Load data from DB for the aggregate request
+            let (hypotheses, evidence, analysis_run) = crate::jobs::phase_b_controller::load_prequal_data_v3(pool, company_id, run_id).await
+                .unwrap_or_default();
+            let prequal_data = serde_json::json!({
+                "hypotheses": hypotheses,
+                "evidence": evidence,
+                "analysis_run": analysis_run,
+            });
+            let apollo_enrichment = crate::jobs::phase_b_controller::load_apollo_enrichment_v3(pool, company_id).await
+                .unwrap_or(serde_json::json!({}));
+            let phase0 = crate::jobs::phase_b_controller::load_phase0_result(pool, company_id, client_id).await
+                .ok().flatten();
+            let client_context = crate::jobs::prequal_worker::db::load_client_context(pool, client_id).await
+                .unwrap_or(serde_json::json!({}));
+
+            let aggregate_request = AggregateRequest {
+                client_id,
+                company_id,
+                company_name: company_name.clone(),
+                domain: domain.clone(),
+                mode: "aggregate".to_string(),
+                run_id,
+                prequal_output: prequal_data,
+                apollo_enrichment,
+                employee_metrics_analysis: serde_json::json!({}),
+                funding_analysis: serde_json::json!({}),
+                client_context,
+                phase0_icp: phase0,
+            };
+
+            match trigger_aggregate(http_client.as_ref(), &aggregate_request).await {
+                Ok(result) => {
+                    // Normalize response — handle both full aggregator and lightweight formats.
+                    //
+                    // Full aggregator returns:  { final_score, tier, qualifies, unified_hypotheses, ... }
+                    // Lightweight returns:      { prequal: { final_score, qualifies }, pain_hypotheses, ... }
+                    //
+                    let is_lightweight = result.get("prequal").is_some() && result.get("final_score").is_none();
+
+                    let final_score = result.get("final_score").and_then(|v| v.as_f64())
+                        .or_else(|| result.get("prequal").and_then(|p| p.get("final_score")).and_then(|v| v.as_f64()))
+                        .or_else(|| result.get("prequal").and_then(|p| p.get("score")).and_then(|v| v.as_f64()));
+
+                    let qualifies = result.get("qualifies").and_then(|v| v.as_bool())
+                        .or_else(|| result.get("prequal").and_then(|p| p.get("qualifies")).and_then(|v| v.as_bool()))
+                        .unwrap_or(false);
+
+                    // Compute tier from score if not provided
+                    let tier = result.get("tier").and_then(|v| v.as_str()).map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            match final_score {
+                                Some(s) if s >= 0.75 => "A".to_string(),
+                                Some(s) if s >= 0.60 => "B".to_string(),
+                                Some(s) if s >= 0.50 => "C".to_string(),
+                                _ => "D".to_string(),
+                            }
+                        });
+
+                    // Normalize the result into the format store_aggregate_result expects
+                    let normalized = if is_lightweight {
+                        // Promote lightweight fields to top-level for storage
+                        let mut norm = result.clone();
+                        if let Some(score) = final_score {
+                            norm["final_score"] = serde_json::json!(score);
+                        }
+                        norm["tier"] = serde_json::json!(tier);
+                        norm["qualifies"] = serde_json::json!(qualifies);
+                        norm["do_not_outreach"] = serde_json::json!(
+                            result.get("prequal").and_then(|p| p.get("do_not_outreach")).and_then(|v| v.as_bool()).unwrap_or(false)
+                        );
+                        norm["needs_review"] = serde_json::json!(
+                            result.get("prequal").and_then(|p| p.get("needs_review")).and_then(|v| v.as_bool()).unwrap_or(false)
+                        );
+                        // Map pain_hypotheses → unified_hypotheses for consistent storage
+                        if norm.get("unified_hypotheses").is_none() {
+                            if let Some(hypos) = result.get("pain_hypotheses") {
+                                norm["unified_hypotheses"] = hypos.clone();
+                            }
+                        }
+                        // Build score_breakdown from prequal sub-object
+                        if norm.get("score_breakdown").is_none() {
+                            if let Some(prequal) = result.get("prequal") {
+                                let mut breakdown = serde_json::Map::new();
+                                for key in &["raw_score", "staleness_adjusted_score", "final_score", "staleness_multiplier"] {
+                                    if let Some(v) = prequal.get(*key) { breakdown.insert(key.to_string(), v.clone()); }
+                                }
+                                norm["score_breakdown"] = serde_json::Value::Object(breakdown);
+                            }
+                        }
+                        // Build decision_notes from prequal gates
+                        if norm.get("decision_notes").is_none() {
+                            let mut notes = Vec::new();
+                            if is_lightweight { notes.push(serde_json::json!("Lightweight aggregation (full aggregator unavailable)")); }
+                            if let Some(gates) = result.get("prequal").and_then(|p| p.get("gates_failed")).and_then(|v| v.as_array()) {
+                                for g in gates { notes.push(serde_json::json!(format!("Gate failed: {}", g.as_str().unwrap_or("unknown")))); }
+                            }
+                            if !notes.is_empty() { norm["decision_notes"] = serde_json::Value::Array(notes); }
+                        }
+                        norm
+                    } else {
+                        result.clone()
+                    };
+
+                    if let Err(e) = store_aggregate_result(pool, run_id, company_id, client_id, &normalized).await {
+                        error!("Worker {}: failed to store aggregate: {:?}", worker_id, e);
+                    }
+                    if let Err(e) = update_analysis_run_aggregate_status(pool, run_id, "success", final_score).await {
+                        error!("Worker {}: failed to update run status: {:?}", worker_id, e);
+                    }
+
+                    info!(
+                        "Worker {}: aggregate complete for {} — score={:.2}, tier={}, qualifies={}, mode={}",
+                        worker_id, company_name, final_score.unwrap_or(0.0), tier, qualifies,
+                        if is_lightweight { "lightweight" } else { "full" }
+                    );
+                }
+                Err(e) => {
+                    error!("Worker {}: aggregate failed for {}: {}", worker_id, company_name, e);
+                    let _ = update_analysis_run_aggregate_status(pool, run_id, "failed_aggregate", None).await;
+                    mark_job_failed(pool, job.id, worker_id, &format!("aggregate error: {}", e)).await?;
                     return Ok(());
                 }
             }

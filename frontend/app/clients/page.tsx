@@ -4,14 +4,15 @@ import { useState } from 'react';
 import Link from 'next/link';
 import { PageShell } from '@/components/layout/page-shell';
 import { StatusBadge } from '@/components/ui/status-badge';
-import { useClients, useCreateClient } from '@/lib/api/client';
+import { useClients, useCreateClient, useDeleteClient } from '@/lib/api/client';
 import { timeAgo, formatNumber } from '@/lib/utils/format';
-import { Plus, X } from 'lucide-react';
+import { Plus, X, Trash2 } from 'lucide-react';
 
 export default function ClientsPage() {
   const { data, isLoading } = useClients();
   const [showCreate, setShowCreate] = useState(false);
   const clients = data?.data ?? [];
+  const deleteClient = useDeleteClient();
 
   return (
     <PageShell
@@ -37,13 +38,14 @@ export default function ClientsPage() {
               <th className="text-right px-4 py-3 font-medium text-muted-foreground">Pending</th>
               <th className="text-left px-4 py-3 font-medium text-muted-foreground">Autopilot</th>
               <th className="text-left px-4 py-3 font-medium text-muted-foreground">Last run</th>
+              <th className="w-10 px-4 py-3"></th>
             </tr>
           </thead>
           <tbody className="divide-y divide-border">
             {isLoading ? (
-              <tr><td colSpan={7} className="px-4 py-8 text-center text-muted-foreground">Loading...</td></tr>
+              <tr><td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">Loading...</td></tr>
             ) : clients.length === 0 ? (
-              <tr><td colSpan={7} className="px-4 py-8 text-center text-muted-foreground">No clients yet</td></tr>
+              <tr><td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">No clients yet</td></tr>
             ) : (
               clients.map((client) => (
                 <tr key={client.id} className="hover:bg-muted/30 transition-colors">
@@ -64,6 +66,20 @@ export default function ClientsPage() {
                     </span>
                   </td>
                   <td className="px-4 py-3 text-xs text-muted-foreground">{timeAgo(client.stats?.last_discovery_run)}</td>
+                  <td className="px-4 py-3">
+                    <button
+                      onClick={() => {
+                        if (confirm(`Delete "${client.name}" and ALL associated data (companies, prequal, configs)? This cannot be undone.`)) {
+                          deleteClient.mutate(client.id);
+                        }
+                      }}
+                      disabled={deleteClient.isPending}
+                      title="Delete client"
+                      className="p-1 text-muted-foreground hover:text-red-600 transition-colors disabled:opacity-50"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </td>
                 </tr>
               ))
             )}

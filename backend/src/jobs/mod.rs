@@ -15,6 +15,9 @@ pub mod prequal_listener;
 // V3: Prequal Worker (batch dispatch + execution)
 pub mod prequal_worker;
 
+// V5: Client Onboarding AI
+pub mod onboarding;
+
 // Re-export commonly used items for convenience
 pub use models::{Job, JobStatus, JobType};
 

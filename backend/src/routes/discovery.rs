@@ -1,8 +1,6 @@
 // src/routes/discovery.rs
 //
-// Discovery run endpoints: trigger, list, detail, companies.
-//
-// Discovery runs are async: POST creates a job, worker picks it up.
+// Discovery run endpoints: trigger with full config, list, detail, companies.
 
 use axum::{
     extract::{Path, Query, State},
@@ -42,24 +40,51 @@ pub struct DiscoveryRunRow {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Full discovery config — all fields from DiscoverCompaniesPayload.
+/// Every field is optional; backend defaults apply if omitted.
 #[derive(Debug, Deserialize)]
 pub struct CreateDiscoveryRequest {
-    #[serde(default = "default_batch_target")]
-    pub batch_target: i32,
-    #[serde(default = "default_page_size")]
-    pub page_size: i32,
-    #[serde(default = "default_exploration_pct")]
-    pub exploration_pct: f64,
-    #[serde(default = "default_max_runtime")]
-    pub max_runtime_seconds: u64,
+    /// Total unique companies to target. Default: 2000 (use 50-200 for testing!)
+    #[serde(default)]
+    pub batch_target: Option<i32>,
+
+    /// Results per page (max 100). Default: 100
+    #[serde(default)]
+    pub page_size: Option<i32>,
+
+    /// Fraction of quota for exploration vs yield-based. Default: 0.20
+    #[serde(default)]
+    pub exploration_pct: Option<f64>,
+
+    /// Min companies per industry. Default: 50
+    #[serde(default)]
+    pub min_per_industry: Option<i32>,
+
+    /// Max companies per industry. Default: 600
+    #[serde(default)]
+    pub max_per_industry: Option<i32>,
+
+    /// Max pages per query variant. Default: 50
+    #[serde(default)]
+    pub max_pages_per_query: Option<i32>,
+
+    /// Wall-clock limit in seconds. Default: 3600
+    #[serde(default)]
+    pub max_runtime_seconds: Option<u64>,
+
+    /// Auto-enqueue prequal after discovery. Default: true
     #[serde(default = "default_true")]
     pub enqueue_prequal_jobs: bool,
+
+    /// Ignore persisted cursors, re-scan from page 1. Default: false
+    #[serde(default)]
+    pub force_full_rescan: bool,
+
+    /// Force full pipeline (discovery → prequal) regardless of autopilot setting
+    #[serde(default)]
+    pub force_full_pipeline: bool,
 }
 
-fn default_batch_target() -> i32 { 500 }
-fn default_page_size() -> i32 { 100 }
-fn default_exploration_pct() -> f64 { 0.20 }
-fn default_max_runtime() -> u64 { 1800 }
 fn default_true() -> bool { true }
 
 #[derive(Debug, Deserialize)]
@@ -92,7 +117,7 @@ pub struct CandidateRow {
 // Handlers
 // ============================================================================
 
-/// POST /api/clients/:id/discovery-runs — enqueue a discover_companies job
+/// POST /api/clients/:id/discovery-runs — enqueue with full config
 pub async fn create(
     State(state): State<AppState>,
     Path(client_id): Path<Uuid>,
@@ -112,15 +137,27 @@ pub async fn create(
         return Err(not_found("Client not found"));
     }
 
-    // Enqueue discover_companies job
-    let payload = json!({
+    // Build payload with all config fields
+    // Only include fields that were explicitly set; backend defaults handle the rest
+    let mut payload = json!({
         "client_id": client_id,
-        "batch_target": body.batch_target,
-        "page_size": body.page_size,
-        "exploration_pct": body.exploration_pct,
-        "max_runtime_seconds": body.max_runtime_seconds,
         "enqueue_prequal_jobs": body.enqueue_prequal_jobs,
+        "force_full_rescan": body.force_full_rescan,
     });
+
+    if body.force_full_pipeline {
+        payload["force_full_pipeline"] = json!(true);
+    }
+
+    // Only include optional fields if set (otherwise backend defaults apply)
+    let obj = payload.as_object_mut().unwrap();
+    if let Some(v) = body.batch_target { obj.insert("batch_target".into(), json!(v)); }
+    if let Some(v) = body.page_size { obj.insert("page_size".into(), json!(v)); }
+    if let Some(v) = body.exploration_pct { obj.insert("exploration_pct".into(), json!(v)); }
+    if let Some(v) = body.min_per_industry { obj.insert("min_per_industry".into(), json!(v)); }
+    if let Some(v) = body.max_per_industry { obj.insert("max_per_industry".into(), json!(v)); }
+    if let Some(v) = body.max_pages_per_query { obj.insert("max_pages_per_query".into(), json!(v)); }
+    if let Some(v) = body.max_runtime_seconds { obj.insert("max_runtime_seconds".into(), json!(v)); }
 
     let job_id = sqlx::query_scalar::<_, Uuid>(
         r#"INSERT INTO jobs (client_id, job_type, payload, status, run_at)
@@ -136,7 +173,12 @@ pub async fn create(
         db_error("Failed to enqueue discovery job")
     })?;
 
-    info!("Enqueued discover_companies job {} for client {}", job_id, client_id);
+    info!(
+        "Enqueued discover_companies job {} for client {} (batch_target={}, enqueue_prequal={})",
+        job_id, client_id,
+        body.batch_target.unwrap_or(2000),
+        body.enqueue_prequal_jobs,
+    );
 
     Ok((
         StatusCode::ACCEPTED,
@@ -144,6 +186,7 @@ pub async fn create(
             "data": {
                 "job_id": job_id,
                 "status": "pending",
+                "config": payload,
                 "message": "Discovery job enqueued"
             }
         })),
@@ -209,11 +252,7 @@ pub async fn list(
 
     Ok(Json(json!({
         "data": runs,
-        "meta": {
-            "total": total,
-            "page": params.page,
-            "per_page": params.per_page,
-        }
+        "meta": { "total": total, "page": params.page, "per_page": params.per_page }
     })))
 }
 
@@ -288,15 +327,9 @@ pub async fn companies(
 // ============================================================================
 
 fn db_error(msg: &str) -> (StatusCode, Json<JsonValue>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": { "code": "db_error", "message": msg } })),
-    )
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": { "code": "db_error", "message": msg } })))
 }
 
 fn not_found(msg: &str) -> (StatusCode, Json<JsonValue>) {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({ "error": { "code": "not_found", "message": msg } })),
-    )
+    (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "not_found", "message": msg } })))
 }

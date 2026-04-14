@@ -5,12 +5,13 @@ import { usePathname } from 'next/navigation';
 import { cn } from '@/lib/utils/cn';
 import {
   LayoutDashboard, Users, Search, Building2, ShieldCheck,
-  ListTodo, ScrollText, Settings, Activity,
+  ListTodo, ScrollText, Settings, Activity, Sparkles,
 } from 'lucide-react';
 
 const NAV_ITEMS = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/clients', label: 'Clients', icon: Users },
+  { href: '/onboarding', label: 'Onboarding', icon: Sparkles },
   { href: '/discovery-runs', label: 'Discovery', icon: Search },
   { href: '/companies', label: 'Companies', icon: Building2 },
   { href: '/prequal-runs', label: 'Prequal', icon: ShieldCheck },

@@ -33,6 +33,15 @@ pub enum JobType {
     // V3: Prequal Worker job types
     PrequalDispatch,
     PrequalBatch,
+
+    // V4: Client Onboarding AI
+    StartClientOnboarding,
+    OnboardingEnrichAndCrawl,
+    OnboardingGenerateDrafts,
+    OnboardingFinalizeDraft,
+
+    // V5: Aggregator
+    RunAggregate,
 }
 
 impl JobType {
@@ -56,6 +65,15 @@ impl JobType {
             // V3: Prequal Worker
             JobType::PrequalDispatch => "prequal_dispatch",
             JobType::PrequalBatch => "prequal_batch",
+
+            // V4: Client Onboarding AI
+            JobType::StartClientOnboarding => "start_client_onboarding",
+            JobType::OnboardingEnrichAndCrawl => "onboarding_enrich_and_crawl",
+            JobType::OnboardingGenerateDrafts => "onboarding_generate_drafts",
+            JobType::OnboardingFinalizeDraft => "onboarding_finalize_draft",
+
+            // V5: Aggregator
+            JobType::RunAggregate => "run_aggregate",
         }
     }
 }
@@ -87,6 +105,15 @@ impl FromStr for JobType {
             "prequal_dispatch" => Ok(JobType::PrequalDispatch),
             "prequal_batch" => Ok(JobType::PrequalBatch),
 
+            // V4: Client Onboarding AI (snake_case)
+            "start_client_onboarding" => Ok(JobType::StartClientOnboarding),
+            "onboarding_enrich_and_crawl" => Ok(JobType::OnboardingEnrichAndCrawl),
+            "onboarding_generate_drafts" => Ok(JobType::OnboardingGenerateDrafts),
+            "onboarding_finalize_draft" => Ok(JobType::OnboardingFinalizeDraft),
+
+            // V5: Aggregator
+            "run_aggregate" => Ok(JobType::RunAggregate),
+
             // optional: legacy UPPER_CASE support
             "DISCOVER_PROSPECTS" => Ok(JobType::DiscoverProspects),
             "DISCOVER_COMPANIES" => Ok(JobType::DiscoverCompanies),
@@ -104,6 +131,15 @@ impl FromStr for JobType {
             // V3: Prequal Worker (UPPER_CASE)
             "PREQUAL_DISPATCH" => Ok(JobType::PrequalDispatch),
             "PREQUAL_BATCH" => Ok(JobType::PrequalBatch),
+
+            // V4: Client Onboarding AI (UPPER_CASE)
+            "START_CLIENT_ONBOARDING" => Ok(JobType::StartClientOnboarding),
+            "ONBOARDING_ENRICH_AND_CRAWL" => Ok(JobType::OnboardingEnrichAndCrawl),
+            "ONBOARDING_GENERATE_DRAFTS" => Ok(JobType::OnboardingGenerateDrafts),
+            "ONBOARDING_FINALIZE_DRAFT" => Ok(JobType::OnboardingFinalizeDraft),
+
+            // V5: Aggregator (UPPER_CASE)
+            "RUN_AGGREGATE" => Ok(JobType::RunAggregate),
 
             other => Err(format!("Unknown job_type: {}", other)),
         }

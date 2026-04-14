@@ -6,10 +6,10 @@ import { PageShell } from '@/components/layout/page-shell';
 import { StatusBadge } from '@/components/ui/status-badge';
 import { ScoreBar } from '@/components/ui/score-bar';
 import { JsonViewer, CollapsibleSection } from '@/components/ui/json-viewer';
-import { useCompanyDetail, useCompanyHypotheses, useCompanyNews, useCompanyFullPrequal, useRerunPrequal, useDeleteCompany } from '@/lib/api/client';
-import { RefreshCw, Trash2 } from 'lucide-react';
+import { useCompanyDetail, useCompanyHypotheses, useCompanyNews, useCompanyFullPrequal, useRerunPrequal, useDeleteCompany, useCompanyAggregate, useAggregateCompany } from '@/lib/api/client';
+import { RefreshCw, Trash2, Layers } from 'lucide-react';
 
-const TABS = ['overview', 'hypotheses', 'news', 'raw'] as const;
+const TABS = ['overview', 'hypotheses', 'news', 'aggregate', 'raw'] as const;
 type Tab = typeof TABS[number];
 
 export default function CompanyDetailPage({ params }: { params: { id: string } }) {
@@ -24,6 +24,8 @@ export default function CompanyDetailPage({ params }: { params: { id: string } }
   const { data: hypothesesData, isLoading: hypoLoading } = useCompanyHypotheses(id, tab === 'hypotheses');
   const { data: newsData, isLoading: newsLoading } = useCompanyNews(id, tab === 'news');
   const { data: fullPrequalData, isLoading: rawLoading } = useCompanyFullPrequal(id, tab === 'raw');
+  const { data: aggregateData, isLoading: aggLoading } = useCompanyAggregate(id, tab === 'aggregate' || tab === 'overview');
+  const triggerAggregate = useAggregateCompany(id);
 
   const handleDelete = async () => {
     const name = data?.data?.company?.name ?? id;
@@ -47,6 +49,10 @@ export default function CompanyDetailPage({ params }: { params: { id: string } }
           <button onClick={() => rerunPrequal.mutate()} disabled={rerunPrequal.isPending}
             className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-border hover:bg-muted disabled:opacity-50">
             <RefreshCw className={`w-3.5 h-3.5 ${rerunPrequal.isPending ? 'animate-spin' : ''}`} /> Rerun prequal
+          </button>
+          <button onClick={() => triggerAggregate.mutate()} disabled={triggerAggregate.isPending}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-purple-300 text-purple-600 hover:bg-purple-50 dark:border-purple-800 dark:hover:bg-purple-900/20 disabled:opacity-50">
+            <Layers className={`w-3.5 h-3.5 ${triggerAggregate.isPending ? 'animate-spin' : ''}`} /> Aggregate
           </button>
           <button onClick={handleDelete} disabled={deleteCompany.isPending}
             className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-red-300 text-red-600 hover:bg-red-50 dark:border-red-800 dark:hover:bg-red-900/20 disabled:opacity-50">
@@ -78,9 +84,10 @@ export default function CompanyDetailPage({ params }: { params: { id: string } }
         ))}
       </div>
 
-      {tab === 'overview' && <OverviewTab prequal={latest_prequal} offerFit={offer_fit} snapshot={snapshot} />}
+      {tab === 'overview' && <OverviewTab prequal={latest_prequal} offerFit={offer_fit} snapshot={snapshot} aggregate={aggregateData?.data} />}
       {tab === 'hypotheses' && <HypothesesTab data={hypothesesData?.data} loading={hypoLoading} />}
       {tab === 'news' && <NewsTab data={newsData?.data} loading={newsLoading} />}
+      {tab === 'aggregate' && <AggregateTab data={aggregateData?.data} loading={aggLoading} />}
       {tab === 'raw' && <RawTab data={fullPrequalData?.data} loading={rawLoading} />}
     </PageShell>
   );
@@ -89,9 +96,47 @@ export default function CompanyDetailPage({ params }: { params: { id: string } }
 // ============================================================================
 // Overview — prequal summary + offer fit + snapshot
 // ============================================================================
-function OverviewTab({ prequal, offerFit, snapshot }: { prequal: any; offerFit: any; snapshot: any }) {
+function OverviewTab({ prequal, offerFit, snapshot, aggregate }: { prequal: any; offerFit: any; snapshot: any; aggregate?: any }) {
+  const TIER_COLORS: Record<string, string> = {
+    A: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300',
+    B: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300',
+    C: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300',
+    D: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300',
+  };
+
   return (
     <div className="space-y-4">
+      {/* Aggregate final result banner (if available) */}
+      {aggregate && (
+        <div className={`p-4 rounded-lg border ${aggregate.qualifies ? 'bg-emerald-50 dark:bg-emerald-900/10 border-emerald-200 dark:border-emerald-800' : 'bg-red-50 dark:bg-red-900/10 border-red-200 dark:border-red-800'}`}>
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-medium">Aggregated Result (Final)</h3>
+            <div className="flex items-center gap-2">
+              <span className={`px-2 py-0.5 text-xs font-bold rounded ${TIER_COLORS[aggregate.tier] ?? TIER_COLORS.D}`}>
+                Tier {aggregate.tier}
+              </span>
+              <span className="text-sm font-mono font-bold">{aggregate.final_score?.toFixed(3)}</span>
+              {aggregate.do_not_outreach && <span className="px-2 py-0.5 text-xs bg-red-600 text-white rounded">DO NOT OUTREACH</span>}
+              {aggregate.needs_review && <span className="px-2 py-0.5 text-xs bg-amber-200 text-amber-800 rounded">NEEDS REVIEW</span>}
+            </div>
+          </div>
+          {aggregate.decision_notes?.length > 0 && (
+            <div className="space-y-1">
+              {aggregate.decision_notes.map((n: string, i: number) => (
+                <p key={i} className="text-xs text-muted-foreground">• {n}</p>
+              ))}
+            </div>
+          )}
+          {aggregate.recommended_personas?.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1">
+              <span className="text-xs text-muted-foreground mr-1">Target:</span>
+              {aggregate.recommended_personas.map((p: string, i: number) => (
+                <span key={i} className="px-1.5 py-0.5 text-xs bg-secondary text-secondary-foreground rounded">{p}</span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
       {/* Prequal + Decision row */}
       {prequal ? (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -262,8 +307,149 @@ function NewsTab({ data, loading }: { data: any; loading: boolean }) {
 }
 
 // ============================================================================
-// Raw JSON — full_result from company_prequal
+// Aggregate — final unified result from aggregate_results table
 // ============================================================================
+function AggregateTab({ data, loading }: { data: any; loading: boolean }) {
+  if (loading) return <p className="text-sm text-muted-foreground">Loading aggregate data...</p>;
+  if (!data) return <p className="text-sm text-muted-foreground">No aggregate result yet. Run the aggregator first (requires prequal + Apollo enrichment).</p>;
+
+  const TIER_COLORS: Record<string, string> = {
+    A: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300',
+    B: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300',
+    C: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300',
+    D: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300',
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* Score header */}
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+        <div className="p-3 bg-card border border-border rounded-lg text-center">
+          <p className="text-2xl font-bold tabular-nums">{data.final_score?.toFixed(3)}</p>
+          <p className="text-xs text-muted-foreground">Final Score</p>
+        </div>
+        <div className="p-3 bg-card border border-border rounded-lg text-center">
+          <p className={`text-2xl font-bold px-3 py-1 rounded inline-block ${TIER_COLORS[data.tier] ?? ''}`}>Tier {data.tier}</p>
+          <p className="text-xs text-muted-foreground">Tier</p>
+        </div>
+        <div className="p-3 bg-card border border-border rounded-lg text-center">
+          <p className={`text-2xl font-bold ${data.qualifies ? 'text-emerald-600' : 'text-red-600'}`}>{data.qualifies ? 'YES' : 'NO'}</p>
+          <p className="text-xs text-muted-foreground">Qualifies</p>
+        </div>
+        <div className="p-3 bg-card border border-border rounded-lg text-center">
+          <p className={`text-2xl font-bold ${data.do_not_outreach ? 'text-red-600' : 'text-emerald-600'}`}>{data.do_not_outreach ? 'YES' : 'NO'}</p>
+          <p className="text-xs text-muted-foreground">Do Not Outreach</p>
+        </div>
+        <div className="p-3 bg-card border border-border rounded-lg text-center">
+          <p className="text-2xl font-bold tabular-nums">{data.llm_calls ?? '—'}</p>
+          <p className="text-xs text-muted-foreground">LLM Calls</p>
+        </div>
+      </div>
+
+      {/* Score breakdown */}
+      {data.score_breakdown && Object.keys(data.score_breakdown).length > 0 && (
+        <div className="bg-card border border-border rounded-lg p-4">
+          <h3 className="text-sm font-medium mb-2">Score Breakdown</h3>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+            {Object.entries(data.score_breakdown).map(([key, val]) => (
+              <div key={key} className="p-2 bg-muted/30 rounded text-center">
+                <p className="text-lg font-bold tabular-nums">{typeof val === 'number' ? (val as number).toFixed(2) : String(val)}</p>
+                <p className="text-xs text-muted-foreground">{key.replace(/_/g, ' ')}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Unified hypotheses */}
+      {data.unified_hypotheses?.length > 0 && (
+        <div className="bg-card border border-border rounded-lg p-4">
+          <h3 className="text-sm font-medium mb-3">Unified Hypotheses ({data.unified_hypotheses.length})</h3>
+          <div className="space-y-3">
+            {data.unified_hypotheses.map((h: any, i: number) => (
+              <div key={i} className="p-3 bg-muted/30 rounded-lg space-y-2">
+                <p className="text-sm leading-relaxed">{h.hypothesis || h.unified_hypothesis || h.title || JSON.stringify(h).slice(0, 300)}</p>
+                <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+                  {h.confidence != null && <span>Confidence: {typeof h.confidence === 'number' ? h.confidence.toFixed(2) : h.confidence}</span>}
+                  {h.strength && <span className="px-1.5 py-0.5 bg-secondary rounded">{h.strength}</span>}
+                  {h.pain_category && <span className="px-1.5 py-0.5 bg-secondary rounded">{h.pain_category}</span>}
+                  {h.why_now && <span className="px-1.5 py-0.5 bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 rounded">why now</span>}
+                </div>
+                {h.suggested_offer_fit && <p className="text-xs text-muted-foreground">Offer fit: {h.suggested_offer_fit}</p>}
+                {h.recommended_personas?.length > 0 && (
+                  <div className="flex flex-wrap gap-1">
+                    {h.recommended_personas.map((p: string, j: number) => (
+                      <span key={j} className="px-1.5 py-0.5 text-xs bg-primary/10 text-primary rounded">{p}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Tech context */}
+      {data.tech_context && Object.keys(data.tech_context).length > 0 && (
+        <CollapsibleSection title="Tech Context & Fit">
+          <JsonViewer data={data.tech_context} />
+        </CollapsibleSection>
+      )}
+
+      {/* Final offer fit */}
+      {data.final_offer_fit && Object.keys(data.final_offer_fit).length > 0 && (
+        <CollapsibleSection title="Final Offer Fit">
+          <JsonViewer data={data.final_offer_fit} />
+        </CollapsibleSection>
+      )}
+
+      {/* Contact suggestions */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        {data.recommended_personas?.length > 0 && (
+          <div className="bg-card border border-border rounded-lg p-4">
+            <h4 className="text-xs font-medium text-muted-foreground mb-2">Recommended Personas</h4>
+            <div className="flex flex-wrap gap-1">{data.recommended_personas.map((p: string, i: number) => (
+              <span key={i} className="px-1.5 py-0.5 text-xs bg-primary/10 text-primary rounded">{p}</span>
+            ))}</div>
+          </div>
+        )}
+        {data.title_keywords?.length > 0 && (
+          <div className="bg-card border border-border rounded-lg p-4">
+            <h4 className="text-xs font-medium text-muted-foreground mb-2">Title Keywords</h4>
+            <div className="flex flex-wrap gap-1">{data.title_keywords.map((t: string, i: number) => (
+              <span key={i} className="px-1.5 py-0.5 text-xs bg-secondary text-secondary-foreground rounded">{t}</span>
+            ))}</div>
+          </div>
+        )}
+        {data.title_exact?.length > 0 && (
+          <div className="bg-card border border-border rounded-lg p-4">
+            <h4 className="text-xs font-medium text-muted-foreground mb-2">Exact Titles to Search</h4>
+            <div className="flex flex-wrap gap-1">{data.title_exact.map((t: string, i: number) => (
+              <span key={i} className="px-1.5 py-0.5 text-xs bg-secondary text-secondary-foreground rounded">{t}</span>
+            ))}</div>
+          </div>
+        )}
+      </div>
+
+      {/* Decision notes */}
+      {data.decision_notes?.length > 0 && (
+        <div className="bg-card border border-border rounded-lg p-4">
+          <h3 className="text-sm font-medium mb-2">Decision Notes</h3>
+          <div className="space-y-1">
+            {data.decision_notes.map((n: string, i: number) => (
+              <p key={i} className="text-xs text-muted-foreground">• {n}</p>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Meta */}
+      {data.duration_ms && (
+        <p className="text-xs text-muted-foreground">Aggregation took {(data.duration_ms / 1000).toFixed(1)}s with {data.llm_calls} LLM calls</p>
+      )}
+    </div>
+  );
+}
 function RawTab({ data, loading }: { data: any; loading: boolean }) {
   if (loading) return <p className="text-sm text-muted-foreground">Loading...</p>;
   if (!data) return <p className="text-sm text-muted-foreground">No prequal data</p>;
