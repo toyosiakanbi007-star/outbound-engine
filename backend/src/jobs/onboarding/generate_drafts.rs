@@ -149,10 +149,27 @@ Configuration for the outbound engine. Include:
 - calendar_link: "[PLACEHOLDER - operator must set]"
 - sender_name: "[PLACEHOLDER - operator must set]"
 - sender_email: "[PLACEHOLDER - operator must set]"
-- offer_capabilities: array of specific capabilities/features they offer
+- offer_capabilities: array of specific capabilities/features they offer (be thorough, 5-15 items)
 - outreach_angles: array of 3-5 potential outreach angles based on their product
 - signal_preferences: { strong_signals: [...], weak_signals: [...] }
 - source_preferences: { prioritize: [...], deprioritize: [...] }
+
+### Pain Category Fit Classification
+Based on the company's actual product/service, classify which pain categories are strong, medium, or weak fit:
+- strong_fit_categories: array of pain categories where the company's product DIRECTLY solves the pain (e.g., a surveillance vendor → "security_compliance" is strong)
+- medium_fit_categories: array of pain categories where the product has INDIRECT relevance
+- weak_fit_categories: array of pain categories where the product has NO meaningful connection
+Available categories: reliability_uptime, operational_visibility, cost_pressure, scaling_capacity, workflow_efficiency, sales_pipeline, customer_churn, security_compliance, tech_debt_migration, talent_execution_gaps, competitive_pressure, market_expansion
+
+### Technology Preferences
+Based on the company's integrations, product docs, and case studies, infer:
+- technology_preferences:
+  - must_support: array of technologies a prospect MUST use for the product to be relevant (e.g., ["Salesforce", "HubSpot"] for a CRM integration tool)
+  - nice_to_have: array of technologies that indicate a good fit but aren't required
+  - avoid: array of technologies that signal the prospect is unlikely to buy (e.g., they already use a direct competitor)
+  - competitor_tech: object mapping competitor names to their product names (e.g., {"Competitor A": "CompProduct"})
+  - confidence: 0.0-1.0 how confident you are in these tech preferences
+  - evidence_urls: array of URLs from the knowledge pack that informed these preferences
 
 ## 2. draft_prequal_config
 Sensible defaults for the prequal pipeline:
@@ -168,6 +185,8 @@ Adjust batch_size and dispatch_interval based on how niche/broad the ICP is.
 ## 3. draft_icp
 Ideal Customer Profile for discovery and qualification:
 - target_roles: array of 5-8 likely buyer/decision-maker titles
+- preferred_personas: array of 3-5 ideal personas to reach out to (e.g., "VP of Security", "Head of Compliance")
+- non_preferred_personas: array of personas to AVOID (e.g., "Intern", "Junior Developer")
 - target_profile:
   - industries: array of objects with { name, priority (1-3), diffbot_category, include_keywords_any, exclude_keywords_any }
   - company_sizes: array of size bands like "51-200", "201-500"
@@ -177,7 +196,9 @@ Ideal Customer Profile for discovery and qualification:
 - strong_signals: array of high-value signals to look for
 - weak_signals: array of lower-value signals
 - disqualify_if: array of automatic disqualifiers
-- pain_categories_priority: array of pain categories ordered by relevance
+- pain_categories_priority: array of ALL relevant pain categories ordered by relevance to this client's product. Most relevant first. This drives scoring weights.
+- discovery_keywords: array of keyword families useful for finding prospects (e.g., ["compliance automation", "trade surveillance", "regulatory reporting"])
+- exclusion_keywords: array of keywords that indicate a bad fit
 
 ## 4. review_notes
 For the human operator reviewing the output:
@@ -185,8 +206,9 @@ For the human operator reviewing the output:
 - missing_information: array of things you couldn't determine
 - uncertain_sections: array of sections with low confidence
 - recommended_review_points: array of things the operator should verify
-- confidence_by_section: { config: 0.0-1.0, prequal: 0.0-1.0, icp: 0.0-1.0 }
+- confidence_by_section: { config: 0.0-1.0, prequal: 0.0-1.0, icp: 0.0-1.0, tech_preferences: 0.0-1.0 }
 - icp_rationale: 2-3 sentences explaining why you chose this ICP
+- tech_preferences_rationale: 1-2 sentences explaining how you inferred technology preferences
 
 ## Rules
 - Base EVERYTHING on evidence from the knowledge pack
@@ -195,7 +217,9 @@ For the human operator reviewing the output:
 - Industries must be specific and evidence-based, not generic
 - Pain categories must relate to actual product capabilities
 - Disqualify rules should prevent wasting credits on bad fits
+- Technology preferences should come from integrations pages, docs, case studies, partner pages, or job posts
 - Every section must be practically useful for B2B outbound
+- strong_fit_categories MUST match the company's actual product — do not use global defaults
 
 Respond with a single JSON object containing all 4 keys: draft_config, draft_prequal_config, draft_icp, review_notes."##.to_string()
 }

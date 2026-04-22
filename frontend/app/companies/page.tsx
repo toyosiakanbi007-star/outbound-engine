@@ -9,17 +9,35 @@ import { useCompanies, useDeleteCompany, useClients, useFlushCompanies, useBulkP
 import { formatNumber } from '@/lib/utils/format';
 import { Search, Trash2, RotateCcw, ShieldCheck, Layers, X } from 'lucide-react';
 
-function scoreTier(score: number | null): string {
+function scoreTier(score: number | null | undefined): string {
   if (score == null) return '—';
   if (score >= 0.75) return 'T1';
   if (score >= 0.50) return 'T2';
   return 'T3';
 }
 
+function aggregateTierLabel(tier: string | null | undefined): string {
+  if (!tier) return '—';
+  return tier.toUpperCase(); // A, B, C, D
+}
+
 const TIER_COLORS: Record<string, string> = {
   T1: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300',
   T2: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300',
   T3: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300',
+};
+
+const AGG_TIER_COLORS: Record<string, string> = {
+  A: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300',
+  B: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300',
+  C: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300',
+  D: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300',
+};
+
+const AUTOMATION_COLORS: Record<string, string> = {
+  high: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300',
+  medium: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300',
+  low: 'bg-slate-100 text-slate-700 dark:bg-slate-900/30 dark:text-slate-300',
 };
 
 export default function CompaniesPage() {
@@ -169,18 +187,32 @@ export default function CompaniesPage() {
               <th className="text-left px-4 py-3 font-medium text-muted-foreground">Industry</th>
               <th className="text-right px-4 py-3 font-medium text-muted-foreground">Emp</th>
               <th className="text-left px-4 py-3 font-medium text-muted-foreground">Status</th>
-              <th className="text-left px-4 py-3 font-medium text-muted-foreground">Score</th>
-              <th className="text-center px-4 py-3 font-medium text-muted-foreground">Tier</th>
+              <th className="text-left px-4 py-3 font-medium text-muted-foreground">
+                <div className="flex flex-col leading-tight">
+                  <span>Prequal</span>
+                  <span className="text-[10px] opacity-60">Aggregate</span>
+                </div>
+              </th>
+              <th className="text-center px-4 py-3 font-medium text-muted-foreground">
+                <div className="flex flex-col leading-tight">
+                  <span>Tier</span>
+                  <span className="text-[10px] opacity-60">Agg</span>
+                </div>
+              </th>
+              <th className="text-center px-4 py-3 font-medium text-muted-foreground">Auto</th>
               <th className="w-10 px-4 py-3"></th>
             </tr>
           </thead>
           <tbody className="divide-y divide-border">
             {isLoading ? (
-              <tr><td colSpan={9} className="px-4 py-8 text-center text-muted-foreground">Loading...</td></tr>
+              <tr><td colSpan={10} className="px-4 py-8 text-center text-muted-foreground">Loading...</td></tr>
             ) : companies.length === 0 ? (
-              <tr><td colSpan={9} className="px-4 py-8 text-center text-muted-foreground">No companies found</td></tr>
+              <tr><td colSpan={10} className="px-4 py-8 text-center text-muted-foreground">No companies found</td></tr>
             ) : companies.map((c: any) => {
-              const t = scoreTier(c.latest_score);
+              const prequalTier = scoreTier(c.latest_score);
+              const aggTier = aggregateTierLabel(c.aggregate_tier);
+              const hasAggregate = c.aggregate_score != null;
+              const automation = c.automation_confidence;
               return (
                 <tr key={c.id} className={`hover:bg-muted/30 transition-colors ${selected.has(c.id) ? 'bg-primary/5' : ''}`}>
                   <td className="px-4 py-3"><input type="checkbox" checked={selected.has(c.id)} onChange={() => toggleSelect(c.id)} className="rounded border-input" /></td>
@@ -189,8 +221,38 @@ export default function CompaniesPage() {
                   <td className="px-4 py-3 text-xs">{c.industry ?? '—'}</td>
                   <td className="px-4 py-3 text-right text-xs tabular-nums">{formatNumber(c.employee_count)}</td>
                   <td className="px-4 py-3">{c.latest_status ? <StatusBadge status={c.latest_status} /> : '—'}</td>
-                  <td className="px-4 py-3"><ScoreBar score={c.latest_score} /></td>
-                  <td className="px-4 py-3 text-center">{t !== '—' && <span className={`px-2 py-0.5 text-xs font-medium rounded ${TIER_COLORS[t] ?? ''}`}>{t}</span>}</td>
+                  {/* Stacked scores: prequal on top, aggregate below */}
+                  <td className="px-4 py-3">
+                    <div className="flex flex-col gap-0.5 min-w-[90px]">
+                      <ScoreBar score={c.latest_score} />
+                      {hasAggregate ? (
+                        <ScoreBar score={c.aggregate_score} />
+                      ) : (
+                        <span className="text-[10px] text-muted-foreground italic">Pending aggregation</span>
+                      )}
+                    </div>
+                  </td>
+                  {/* Stacked tiers: prequal T-tier on top, aggregate A/B/C/D below */}
+                  <td className="px-4 py-3 text-center">
+                    <div className="flex flex-col gap-0.5 items-center">
+                      {prequalTier !== '—' ? (
+                        <span className={`px-2 py-0.5 text-xs font-medium rounded ${TIER_COLORS[prequalTier] ?? ''}`}>{prequalTier}</span>
+                      ) : <span className="text-[10px] text-muted-foreground">—</span>}
+                      {hasAggregate && aggTier !== '—' ? (
+                        <span className={`px-2 py-0.5 text-xs font-bold rounded ${AGG_TIER_COLORS[aggTier] ?? ''}`}>{aggTier}</span>
+                      ) : <span className="text-[10px] text-muted-foreground">—</span>}
+                    </div>
+                  </td>
+                  {/* Automation confidence */}
+                  <td className="px-4 py-3 text-center">
+                    {automation ? (
+                      <span className={`px-2 py-0.5 text-xs font-medium rounded capitalize ${AUTOMATION_COLORS[automation] ?? ''}`}>
+                        {automation}
+                      </span>
+                    ) : (
+                      <span className="text-[10px] text-muted-foreground">—</span>
+                    )}
+                  </td>
                   <td className="px-4 py-3">
                     <button onClick={() => { if (confirm(`Delete "${c.name}"?`)) deleteCompany.mutateAsync(c.id); }} title="Delete"
                       className="p-1 text-muted-foreground hover:text-red-600"><Trash2 className="w-3.5 h-3.5" /></button>

@@ -53,6 +53,12 @@ pub struct CompanyListItem {
     pub source: Option<String>,
     pub latest_status: Option<String>,
     pub latest_score: Option<f64>,
+    // Aggregate fields (NULL when company hasn't been aggregated yet)
+    pub aggregate_score: Option<f64>,
+    pub aggregate_tier: Option<String>,
+    pub aggregate_qualifies: Option<bool>,
+    pub aggregate_do_not_outreach: Option<bool>,
+    pub automation_confidence: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -114,7 +120,7 @@ fn default_sort_order() -> String { "desc".into() }
 // Handlers
 // ============================================================================
 
-/// GET /api/companies — list/search companies with latest prequal status
+/// GET /api/companies — list/search companies with latest prequal + aggregate status
 pub async fn list(
     State(state): State<AppState>,
     Query(params): Query<ListCompaniesQuery>,
@@ -123,10 +129,12 @@ pub async fn list(
     let search_pattern = params.search.as_ref().map(|s| format!("%{}%", s));
 
     // Resolve tier to score range (tier overrides min/max_score if set)
+    // Tier filter now uses COALESCE(aggregate_score, prequal_score) — aggregate is
+    // authoritative when available, prequal is the fallback.
     let (min_score, max_score) = match params.tier.as_deref() {
         Some("1") => (Some(0.75_f64), None),                 // Tier 1: score >= 0.75
         Some("2") => (Some(0.50_f64), Some(0.7499_f64)),     // Tier 2: 0.50 - 0.74
-        Some("3") => (None, Some(0.4999_f64)),                // Tier 3: < 0.50
+        Some("3") => (None, Some(0.4999_f64)),               // Tier 3: < 0.50
         _ => (params.min_score, params.max_score),
     };
 
@@ -136,18 +144,25 @@ pub async fn list(
                   c.employee_count, c.country, c.source,
                   cc.status AS latest_status,
                   cp.score AS latest_score,
+                  ar.final_score AS aggregate_score,
+                  ar.tier AS aggregate_tier,
+                  ar.qualifies AS aggregate_qualifies,
+                  ar.do_not_outreach AS aggregate_do_not_outreach,
+                  ar.automation_confidence,
                   c.created_at
            FROM companies c
            LEFT JOIN company_candidates cc ON cc.company_id = c.id
                AND cc.id = (SELECT id FROM company_candidates WHERE company_id = c.id ORDER BY created_at DESC LIMIT 1)
            LEFT JOIN company_prequal cp ON cp.company_id = c.id
                AND cp.id = (SELECT id FROM company_prequal WHERE company_id = c.id ORDER BY created_at DESC LIMIT 1)
+           LEFT JOIN aggregate_results ar ON ar.company_id = c.id
+               AND ar.id = (SELECT id FROM aggregate_results WHERE company_id = c.id ORDER BY created_at DESC LIMIT 1)
            WHERE ($1::uuid IS NULL OR c.client_id = $1)
              AND ($2::text IS NULL OR cc.status = $2)
              AND ($3::text IS NULL OR c.industry = $3)
              AND ($4::text IS NULL OR c.name ILIKE $4 OR c.domain ILIKE $4)
-             AND ($5::float8 IS NULL OR cp.score >= $5)
-             AND ($6::float8 IS NULL OR cp.score <= $6)
+             AND ($5::float8 IS NULL OR COALESCE(ar.final_score, cp.score) >= $5)
+             AND ($6::float8 IS NULL OR COALESCE(ar.final_score, cp.score) <= $6)
            ORDER BY c.id, c.created_at DESC
            LIMIT $7 OFFSET $8"#,
     )
@@ -610,6 +625,7 @@ pub async fn aggregate(
                 offer_fit AS final_offer_fit,
                 recommended_personas, title_keywords, title_exact,
                 decision_notes, llm_calls, duration_ms,
+                automation_confidence, review_reasons, do_not_outreach_reasons,
                 created_at, updated_at
             FROM aggregate_results
             WHERE company_id = $1
@@ -628,4 +644,88 @@ pub async fn aggregate(
         Some(data) => Ok(Json(json!({ "data": data }))),
         None => Ok(Json(json!({ "data": null }))),
     }
+}
+
+/// GET /api/companies/:id/raw-combined
+/// Returns a unified JSON blob with phase0 + prequal + aggregate for the latest run.
+/// Used by the "Raw JSON" tab on the company detail page.
+pub async fn raw_combined(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<JsonValue>, (StatusCode, Json<JsonValue>)> {
+    // Phase 0: company snapshot + offer_fit decision
+    let phase0_snapshot: Option<JsonValue> = sqlx::query_scalar(
+        r#"SELECT row_to_json(t) FROM (
+            SELECT *
+            FROM company_snapshots
+            WHERE company_id = $1
+            ORDER BY created_at DESC LIMIT 1
+        ) t"#,
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    let phase0_offer_fit: Option<JsonValue> = sqlx::query_scalar(
+        r#"SELECT row_to_json(t) FROM (
+            SELECT *
+            FROM offer_fit_decisions
+            WHERE company_id = $1
+            ORDER BY created_at DESC LIMIT 1
+        ) t"#,
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    // Prequal: full result
+    let prequal: Option<JsonValue> = sqlx::query_scalar(
+        r#"SELECT row_to_json(t) FROM (
+            SELECT id, client_id, company_id, run_id, score, qualifies,
+                   evidence_count, distinct_sources, why_now_indicators,
+                   gates_passed, gates_failed, prequal_reasons, offer_fit_tags,
+                   full_result, created_at
+            FROM company_prequal
+            WHERE company_id = $1
+            ORDER BY created_at DESC LIMIT 1
+        ) t"#,
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    // Aggregate: full result
+    let aggregate: Option<JsonValue> = sqlx::query_scalar(
+        r#"SELECT row_to_json(t) FROM (
+            SELECT
+                final_score, tier, qualifies, do_not_outreach, needs_review,
+                score_breakdown, output_json, unified_hypotheses,
+                tech_fit AS tech_context, offer_fit AS final_offer_fit,
+                recommended_personas, title_keywords, title_exact,
+                decision_notes, llm_calls, duration_ms,
+                automation_confidence, review_reasons, do_not_outreach_reasons,
+                created_at, updated_at
+            FROM aggregate_results
+            WHERE company_id = $1
+            ORDER BY created_at DESC LIMIT 1
+        ) t"#,
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    Ok(Json(json!({
+        "data": {
+            "phase0": {
+                "snapshot": phase0_snapshot,
+                "offer_fit": phase0_offer_fit,
+            },
+            "prequal": prequal,
+            "aggregate": aggregate,
+        }
+    })))
 }

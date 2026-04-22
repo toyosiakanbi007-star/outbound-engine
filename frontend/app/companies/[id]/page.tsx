@@ -6,7 +6,7 @@ import { PageShell } from '@/components/layout/page-shell';
 import { StatusBadge } from '@/components/ui/status-badge';
 import { ScoreBar } from '@/components/ui/score-bar';
 import { JsonViewer, CollapsibleSection } from '@/components/ui/json-viewer';
-import { useCompanyDetail, useCompanyHypotheses, useCompanyNews, useCompanyFullPrequal, useRerunPrequal, useDeleteCompany, useCompanyAggregate, useAggregateCompany } from '@/lib/api/client';
+import { useCompanyDetail, useCompanyHypotheses, useCompanyNews, useCompanyFullPrequal, useRerunPrequal, useDeleteCompany, useCompanyAggregate, useAggregateCompany, useCompanyRawCombined } from '@/lib/api/client';
 import { RefreshCw, Trash2, Layers } from 'lucide-react';
 
 const TABS = ['overview', 'hypotheses', 'news', 'aggregate', 'raw'] as const;
@@ -23,7 +23,7 @@ export default function CompanyDetailPage({ params }: { params: { id: string } }
   // Lazy-loaded from dedicated table endpoints
   const { data: hypothesesData, isLoading: hypoLoading } = useCompanyHypotheses(id, tab === 'hypotheses');
   const { data: newsData, isLoading: newsLoading } = useCompanyNews(id, tab === 'news');
-  const { data: fullPrequalData, isLoading: rawLoading } = useCompanyFullPrequal(id, tab === 'raw');
+  const { data: rawCombinedData, isLoading: rawLoading } = useCompanyRawCombined(id, tab === 'raw');
   const { data: aggregateData, isLoading: aggLoading } = useCompanyAggregate(id, tab === 'aggregate' || tab === 'overview');
   const triggerAggregate = useAggregateCompany(id);
 
@@ -88,7 +88,7 @@ export default function CompanyDetailPage({ params }: { params: { id: string } }
       {tab === 'hypotheses' && <HypothesesTab data={hypothesesData?.data} loading={hypoLoading} />}
       {tab === 'news' && <NewsTab data={newsData?.data} loading={newsLoading} />}
       {tab === 'aggregate' && <AggregateTab data={aggregateData?.data} loading={aggLoading} />}
-      {tab === 'raw' && <RawTab data={fullPrequalData?.data} loading={rawLoading} />}
+      {tab === 'raw' && <RawTab data={rawCombinedData?.data} loading={rawLoading} />}
     </PageShell>
   );
 }
@@ -451,9 +451,59 @@ function AggregateTab({ data, loading }: { data: any; loading: boolean }) {
   );
 }
 function RawTab({ data, loading }: { data: any; loading: boolean }) {
-  if (loading) return <p className="text-sm text-muted-foreground">Loading...</p>;
-  if (!data) return <p className="text-sm text-muted-foreground">No prequal data</p>;
-  return <JsonViewer data={data} />;
+  const [view, setView] = useState<'combined' | 'phase0' | 'prequal' | 'aggregate'>('combined');
+  
+  if (loading) return <p className="text-sm text-muted-foreground">Loading raw data...</p>;
+  if (!data) return <p className="text-sm text-muted-foreground">No data available</p>;
+  
+  const hasPhase0 = data.phase0 && (data.phase0.snapshot || data.phase0.offer_fit);
+  const hasPrequal = !!data.prequal;
+  const hasAggregate = !!data.aggregate;
+  
+  const sectionData =
+    view === 'phase0' ? data.phase0 :
+    view === 'prequal' ? data.prequal :
+    view === 'aggregate' ? data.aggregate :
+    data;
+  
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-2 text-xs">
+        <span className="text-muted-foreground">View:</span>
+        <button
+          onClick={() => setView('combined')}
+          className={`px-2 py-1 rounded ${view === 'combined' ? 'bg-primary text-primary-foreground' : 'bg-muted hover:bg-muted/70'}`}
+        >
+          Combined
+        </button>
+        <button
+          onClick={() => setView('phase0')}
+          disabled={!hasPhase0}
+          className={`px-2 py-1 rounded ${view === 'phase0' ? 'bg-primary text-primary-foreground' : 'bg-muted hover:bg-muted/70'} disabled:opacity-40`}
+        >
+          Phase 0 {!hasPhase0 && '(none)'}
+        </button>
+        <button
+          onClick={() => setView('prequal')}
+          disabled={!hasPrequal}
+          className={`px-2 py-1 rounded ${view === 'prequal' ? 'bg-primary text-primary-foreground' : 'bg-muted hover:bg-muted/70'} disabled:opacity-40`}
+        >
+          Prequal {!hasPrequal && '(none)'}
+        </button>
+        <button
+          onClick={() => setView('aggregate')}
+          disabled={!hasAggregate}
+          className={`px-2 py-1 rounded ${view === 'aggregate' ? 'bg-primary text-primary-foreground' : 'bg-muted hover:bg-muted/70'} disabled:opacity-40`}
+        >
+          Aggregate {!hasAggregate && '(none)'}
+        </button>
+        <span className="ml-auto text-muted-foreground">
+          {view === 'combined' ? 'All 3 pipeline stages' : `Just ${view}`}
+        </span>
+      </div>
+      <JsonViewer data={sectionData} />
+    </div>
+  );
 }
 
 // ============================================================================

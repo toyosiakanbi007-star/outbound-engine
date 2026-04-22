@@ -100,6 +100,10 @@ pub async fn run_server(
             get(routes::companies::aggregate),
         )
         .route(
+            "/api/companies/:id/raw-combined",
+            get(routes::companies::raw_combined),
+        )
+        .route(
             "/api/companies/:id/actions/rerun-prequal",
             post(routes::companies::rerun_prequal),
         )

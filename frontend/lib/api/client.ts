@@ -537,3 +537,13 @@ export function useCompanyAggregate(id: string, enabled = true) {
   });
 }
 
+export function useCompanyRawCombined(id: string, enabled = true) {
+  return useQuery({
+    queryKey: ['company-raw-combined', id],
+    queryFn: () => apiFetch<{ data: { phase0: any; prequal: any; aggregate: any } }>(
+      `/companies/${id}/raw-combined`
+    ),
+    enabled: !!id && enabled,
+  });
+}
+

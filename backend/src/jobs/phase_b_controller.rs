@@ -760,6 +760,14 @@ pub async fn store_aggregate_result(
     let llm_calls = meta.get("llm_calls").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
     let duration_ms = meta.get("duration_ms").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
     
+    // Extract new aggregator v2 fields (Groups A-C + calibration)
+    let automation_confidence = result.get("automation_confidence")
+        .and_then(|v| v.as_str())
+        .unwrap_or("medium")
+        .to_string();
+    let review_reasons = result.get("review_reasons").cloned().unwrap_or(json!([]));
+    let do_not_outreach_reasons = result.get("do_not_outreach_reasons").cloned().unwrap_or(json!([]));
+    
     sqlx::query(
         r#"
         INSERT INTO aggregate_results (
@@ -782,10 +790,13 @@ pub async fn store_aggregate_result(
             decision_notes,
             llm_calls,
             duration_ms,
+            automation_confidence,
+            review_reasons,
+            do_not_outreach_reasons,
             created_at,
             updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, NOW(), NOW())
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, NOW(), NOW())
         ON CONFLICT (run_id) DO UPDATE SET
             final_score = EXCLUDED.final_score,
             tier = EXCLUDED.tier,
@@ -803,6 +814,9 @@ pub async fn store_aggregate_result(
             decision_notes = EXCLUDED.decision_notes,
             llm_calls = EXCLUDED.llm_calls,
             duration_ms = EXCLUDED.duration_ms,
+            automation_confidence = EXCLUDED.automation_confidence,
+            review_reasons = EXCLUDED.review_reasons,
+            do_not_outreach_reasons = EXCLUDED.do_not_outreach_reasons,
             updated_at = NOW()
         "#,
     )
@@ -825,6 +839,9 @@ pub async fn store_aggregate_result(
     .bind(&decision_notes)
     .bind(llm_calls)
     .bind(duration_ms)
+    .bind(&automation_confidence)
+    .bind(&review_reasons)
+    .bind(&do_not_outreach_reasons)
     .execute(pool)
     .await?;
     
